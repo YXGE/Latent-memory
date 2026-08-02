@@ -1,0 +1,26 @@
+.git
+.github
+__pycache__/
+*.pyc
+*.pyo
+*.tar
+*.tar.gz
+*.zip
+.env
+*.env
+*.key
+*.pem
+
+# Private generated artifacts must never enter an image build context.
+memory/
+threads.jsonl
+init_state.json
+mcp-config.json
+AGENTS.md
+CLAUDE.md
+persona.md
+*.bak
+.weights.json
+.retractions.json
+.entities.json
+.embed_cache.json

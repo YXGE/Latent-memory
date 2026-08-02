@@ -21,3 +21,12 @@ mcp-config.json
 /注入契约.md
 # 换客户端档时旧人格文件退役成的 .bak，同样是用户的私人内容
 *.bak
+
+# 部署密钥与私人记忆归档同样禁止进入 Git 历史
+.env
+*.env
+*.key
+*.pem
+*.tar
+*.tar.gz
+*.zip
