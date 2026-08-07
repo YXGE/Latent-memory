@@ -20,46 +20,53 @@ tools/list / tools/call，字段名与错误分层均照规格），**已查证�
 
 **成色（2026.08.03 改准，此前写的是“尚未与任何真实客户端握手核对”，已过时）**：
 已有一条真实客户端链路——Operit（Android）＋ proot Ubuntu，客户端按 stdio 拉起本进程，
-握手、工具列表、真实调用三样都走过：五个工具全部接通，`memory_append` 写入后
+握手、工具列表、真实调用三样都走过：五个工具全部接通，`latent_append` 写入后
 **新开会话仍检索命中**。外部实测转录，本项目未复现。
 
 ⚠ **剩下的边界仍然作数，别读成“都验过了”**：Claude 桌面 App 那一格仍未连过；
 超长文本怎么截断、参数容忍度这些真机问题只在一家客户端上过过手。
-另有三条与宿主拉起有关的实测事实记在《快速上手》§3c「部署形态一」：
+另有四条与宿主拉起有关的实测事实记在《快速上手》§3c「部署形态一」：
 stdio 只能由宿主拉起（手动 `nohup` 必崩）、懒加载每次调用重读语料、
-客户端的 `lastStartTime` 不能当跑通判据。
+客户端的 `lastStartTime` 不能当跑通判据、这条路上终端里不会有请求日志
+（stdio 没有端口，“HTTP 终端没收到 latent_search”在这条路上永远成立，
+不是没跑通的证据）。
 
 工具集一一对应现成能力，不新造：
-  memory_search  → MemoryIndex.retrieve
-  session_start  → SessionRecall.on_session_start（thread 块 + 召回块 + 自查指令）
-  memory_append  → memory_retrieval.append_record（正文层的笔）
-  memory_correct → MemoryIndex.retract（+ 可选 append_record 写更正）
-  thread_close   → session_thread.close_thread + ThreadStore.append
+  latent_search  → MemoryIndex.retrieve
+  latent_session_start  → SessionRecall.on_session_start（thread 块 + 召回块 + 自查指令）
+  latent_append  → memory_retrieval.append_record（正文层的笔）
+  latent_correct → MemoryIndex.retract（+ 可选 append_record 写更正）
+  latent_thread_close   → session_thread.close_thread + ThreadStore.append
 
 用法：
   python mcp_server.py --selftest
   python mcp_server.py --corpus <md目录> [--threads <threads.jsonl>]   # stdio 服务
-  python mcp_server.py --corpus <md目录> --http 8765 --token <口令>    # HTTP 服务
+  python mcp_server.py --corpus <md目录> --http 127.0.0.1:8765 --token <口令>  # HTTP 服务
   python mcp_server.py --doctor --corpus <md目录> [--threads <threads.jsonl>]  # 部署体检
 客户端配置（Claude Desktop 之类）里把上面第二条命令填成 server 启动命令即可；
 只认 HTTP 的客户端（Kelivo/Operit 这类）用第三条起服务、客户端里填地址与 token
-（公网仍要域名 + 反代管 TLS，见《快速上手》§3c 部署形态二）；
+（`--http` 的参数是 `[HOST:]PORT`，**省略 HOST 只绑回环、别的机器连不到**；
+公网仍要域名 + 反代管 TLS，见《快速上手》§3c 部署形态二）；
 配完接不上、或者不确定 --corpus 指对了没有时，把同一行参数换成 --doctor 跑一次
 （体检只读，不往语料目录写任何东西）。
 """
 
 import argparse
+import errno
 import hmac
 import http.server
 import io
 import ipaddress
 import json
 import os
+import select
+import socket
 import sys
 import threading
 import time
+import traceback
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone as _dt_tz
 from pathlib import Path
 
 # 同目录模块，import 不触发各自的 CLI
@@ -71,6 +78,9 @@ from embedding_provider import resolve_provider
 from chunking_experiment import chunk_body as _chunk_body, chunk_heading
 from session_recall import SessionRecall, format_recall_block, SELF_CHECK_FOOTER  # noqa: F401
 from session_thread import ThreadStore, close_thread
+# 记忆所有者的时区（任务卡"写回时区与跨日归窗"）：一个进程一份，stdio 与 HTTP
+# 两种起动形态共用同一个，不各自造一份换算逻辑
+from time_context import TimeContext
 
 PROTOCOL_VERSION = "2025-06-18"   # 官方规格版本，已查证
 SERVER_INFO = {"name": "memory-protocol", "title": "记忆协议", "version": "0.1.0"}
@@ -85,15 +95,15 @@ INSTRUCTIONS = (
     "这台服务器挂着用户与你之间的**长期关系记忆库**：跨会话保存的时间线、摘要与"
     "会话收尾，不是本次对话的聊天记录。\n"
     "什么时候用：对方提到过去发生过的事、某个约定、某个日期/地点/称呼/人名，"
-    "或者你对某个细节拿不准——先用 memory_search 查，再开口。\n"
+    "或者你对某个细节拿不准——先用 latent_search 查，再开口。\n"
     "**不要在没查之前说“我没有相关记录”“我不记得”**：挂着记忆库时这句话是错的，"
     "查一下往往就有。查完自然接上话即可，不用报告自己搜过。\n"
     "记忆库不是只读的：对话里出现值得长期记住的事——新约定、重要事件、状态变化、"
-    "对方明确说要记住的——**当场用 memory_append 写进去**，不用请示，不用等会话结束。\n"
-    "记错了的事也有出口：对方指出某段记忆不对或已经过时，**当场用 memory_correct "
+    "对方明确说要记住的——**当场用 latent_append 写进去**，不用请示，不用等会话结束。\n"
+    "记错了的事也有出口：对方指出某段记忆不对或已经过时，**当场用 latent_correct "
     "撤回旧记录并写上更正**——只口头认错不改库，下次照样检索到错的。\n"
     "查过但确实没有的，就如实说没找到——查过之后的“没有”是诚实，查之前的“没有”才是错。\n"
-    "新会话开场先调一次 session_start，会话结束前调一次 thread_close。"
+    "新会话开场先调一次 latent_session_start，会话结束前调一次 latent_thread_close。"
 )
 
 # JSON-RPC 标准错误码（规格"Error Handling"一节：未知工具/参数非法走协议错误）
@@ -102,7 +112,7 @@ E_INVALID_PARAMS = -32602
 
 TOOLS = [
     {
-        "name": "memory_search",
+        "name": "latent_search",
         "title": "检索记忆",
         "description": "检索这段关系的长期记忆库（跨会话保存的时间线与摘要，"
                        "不是本次对话的聊天记录）。**对方提到任何过去发生过的事、"
@@ -119,7 +129,7 @@ TOOLS = [
         },
     },
     {
-        "name": "session_start",
+        "name": "latent_session_start",
         "title": "换窗召回",
         "description": "新会话开场**主动**调一次（不用等对方要求）：带回上次会话聊到哪、"
                        "当下什么状态、有什么没聊完，以及最近发生过的事，"
@@ -127,7 +137,7 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
-        "name": "memory_append",
+        "name": "latent_append",
         "title": "写回记忆",
         "description": "把值得长期记住的事写进记忆库。**对话里出现新约定、重要事件、"
                        "状态变化，或对方明确说要记住的——当场调用，不用请示，也不用等"
@@ -148,12 +158,12 @@ TOOLS = [
         },
     },
     {
-        "name": "memory_correct",
+        "name": "latent_correct",
         "title": "更正记忆",
         "description": "对方指出某段记忆**记错了或已经过时**（关系变了/搬家了/"
                        "计划改了……）时当场调用：撤回那段旧记录（检索不再返回它；"
                        "原文件与撤回原因留档，可追溯），并可同时写入更正后的记录。"
-                       "quote 必须从 memory_search 返回的原文里**逐字**摘一段、"
+                       "quote 必须从 latent_search 返回的原文里**逐字**摘一段、"
                        "足够长能唯一定位那条记录。只口头认错不调这个工具的话，"
                        "库没变，下次照样检索到错的。",
         "inputSchema": {
@@ -172,7 +182,7 @@ TOOLS = [
         },
     },
     {
-        "name": "thread_close",
+        "name": "latent_thread_close",
         "title": "收尾本次会话",
         "description": "会话结束前**主动**调一次：记下这次聊了什么线、当下状态、"
                        "有什么没聊完，下个会话靠它接上。当下状态必填——不写的话，"
@@ -206,13 +216,18 @@ class MemoryServer:
 
     def __init__(self, index=None, thread_store=None, search_topN=5, recall_topN=3,
                  corpus_dir=None, weights_path=None, retractions_path=None,
-                 entities_path=None, loader=None):
+                 entities_path=None, loader=None, time_context=None):
         # 两个 topN 分开（2026.07.31 真实语料冒烟后拆的）：显式检索是用户/模型
         # 主动问一件事，多给几条值；开场召回每次换窗都付一遍，条数要克制
         self.index = index if index is not None else MemoryIndex().build()
         self.thread_store = thread_store if thread_store is not None else ThreadStore()
         self.search_topN = search_topN
-        self.recall = SessionRecall(self.index, topN=recall_topN, thread_store=self.thread_store)
+        # 时区：没传就退宿主本地时区（兼容旧配置），但 --doctor 会报 WARN。
+        # ⚠ 这一份要穿到三处——写回算自然日、召回标日期、检索结果标日期，
+        # 少接一处就会出现"当场对、重启错"或"文件对、标签错"的半拉形态
+        self.time_context = time_context if time_context is not None else TimeContext.default()
+        self.recall = SessionRecall(self.index, topN=recall_topN, thread_store=self.thread_store,
+                                    time_context=self.time_context)
         self.initialized = False
         # 写回与权重持久化（任务卡"记忆写回与权重持久化"）：
         # corpus_dir 是写回的落点，没配就明确拒写；weights_path 没配则权重只活在
@@ -283,7 +298,7 @@ class MemoryServer:
         # 模型拿去圆"，而这个判断只有读到内容的模型能下——机制层负责把不确定性
         # 摆到台面上，不负责替它拒绝。
         # 拼接走 annotate_block（库函数），外壳仍然只是转发+组合调用，不自己拼字符串
-        return annotate_block(format_recall_block(results),
+        return annotate_block(format_recall_block(results, time_context=self.time_context),
                               query_miss_rate(self.index, query))
 
     def _tool_session_start(self, args, now=None):
@@ -302,10 +317,10 @@ class MemoryServer:
             path, chunk_text, meta = append_record(
                 self.corpus_dir, args.get("text") or "",
                 args.get("current_state") or "",
-                window=args.get("window"), now=now)
+                window=args.get("window"), now=now, time_context=self.time_context)
         except (ValueError, OSError) as e:
             raise ToolError(str(e))
-        # 写完立刻进内存索引并重建，本会话的 memory_search 就能查到——
+        # 写完立刻进内存索引并重建，本会话的 latent_search 就能查到——
         # 不然"我记下了"之后当场问它还查不到，模型会顺势说"没有记录"
         self.index.add(chunk_text, meta)
         self.index.build()
@@ -316,7 +331,7 @@ class MemoryServer:
         correction = args.get("correction")
         if correction and not (args.get("current_state") or "").strip():
             raise ToolError("写 correction 时 current_state（当下状态）必填——"
-                            "病灶迁移，同 memory_append：更正这件事现在是什么状态？")
+                            "病灶迁移，同 latent_append：更正这件事现在是什么状态？")
         # 撤回先做——它同时是 quote 的校验关卡；quote 定位不到就该在写任何东西
         # 之前失败（否则更正落了盘、旧记录还在，比什么都没做更糟）
         try:
@@ -335,14 +350,15 @@ class MemoryServer:
             try:
                 path, chunk_text, meta = append_record(
                     self.corpus_dir, f"【更正】{correction}",
-                    args.get("current_state") or "", now=now)
+                    args.get("current_state") or "", now=now,
+                    time_context=self.time_context)
             except (ValueError, OSError) as e:
                 if self.retractions_path is not None:
                     self.index.save_retractions(self.retractions_path)
                 raise ToolError(msg + f" 但更正内容写入失败：{e}")
             self.index.add(chunk_text, meta)
             self.index.build()
-            self.written_paths.add(str(path))    # 同 memory_append，见 __init__ 注释
+            self.written_paths.add(str(path))    # 同 latent_append，见 __init__ 注释
             # 追溯链补上：让账本能回答"哪条记录改了哪条"，不只是"这条被撤了"。
             # 只能在更正写完之后回填——新块的内容哈希这时才存在
             self.index.link_correction(old_idx, chunk_text)
@@ -369,11 +385,11 @@ class MemoryServer:
 
     def _handlers(self):
         return {
-            "memory_search": self._tool_memory_search,
-            "session_start": self._tool_session_start,
-            "memory_append": self._tool_memory_append,
-            "memory_correct": self._tool_memory_correct,
-            "thread_close": self._tool_thread_close,
+            "latent_search": self._tool_memory_search,
+            "latent_session_start": self._tool_session_start,
+            "latent_append": self._tool_memory_append,
+            "latent_correct": self._tool_memory_correct,
+            "latent_thread_close": self._tool_thread_close,
         }
 
     # ---------- 协议层 ----------
@@ -456,8 +472,8 @@ class MemoryServer:
 #
 # 为什么要有这条：闭源前端（Kelivo/Operit 这类）只认 Streamable HTTP，此前用户
 # 只能拿 npm 的 supergateway 把 stdio 桥一层。外部实测撞出来的四个坑全在桥上：
-# ① supergateway 服务端模式**没有任何入站鉴权**——memory_search 读全库、
-#    memory_append 可写入，端口被扫到记忆库就既可读又可写；
+# ① supergateway 服务端模式**没有任何入站鉴权**——latent_search 读全库、
+#    latent_append 可写入，端口被扫到记忆库就既可读又可写；
 # ② 默认 SSE 输出与客户端的 Streamable HTTP 不匹配（`Transport disconnected`）；
 # ③ 进程僵死（在但端口不通）要 pkill 重启；
 # ④ 常驻只在启动时读一次语料，手动加的 md 静默看不到。
@@ -467,16 +483,193 @@ class MemoryServer:
 # （两家独立实测），公网仍然要域名 + 反代（Caddy）那条路，反代顺手把 TLS 管了。
 #
 # 规格面（刻意做小，都是规格允许的服务器侧选择）：
-#   POST 单条 JSON-RPC 消息 → application/json 单条响应；通知 → 202 空身；
-#   GET（SSE 长流）→ 405 不提供，本 server 没有服务器主动推送的场景；
+#   POST 单条 JSON-RPC 消息 → 按客户端 `Accept` 决定形态：默认 application/json
+#     单条响应；客户端**明确只要** text/event-stream 时包成单事件 SSE；通知 → 202 空身；
+#   GET（SSE 长流）→ 给一条**只发心跳、永不发消息**的空长流（规格允许服务器在这条流上
+#     什么都不发）；客户端明确只要 JSON、或 --no-sse-stream 关掉时才回 405；
 #   DELETE（会话终止）→ 200 空操作，本 server 无会话态、不发 Mcp-Session-Id；
 #   JSON 数组（批量）→ 400（批量已从 2025-06 规格移除）。
+#
+# **为什么要看 `Accept`**（2026.08.07，`HTTP传输不看Accept` 那张卡）：
+# 规格在这两处都把选择权留给服务器，而此前我们两处都按自己方便挑了一种、
+# 并**默认客户端会配合**——GET 恒 405（赌它会自己改用 POST）、POST 恒回
+# application/json（赌它认 JSON）。两个赌注**赢面大、输了完全静默**：
+# 不回退的客户端卡在等长流上，只认 SSE 响应体的客户端拿到 JSON 直接接不上，
+# 而后者是 2xx，`_deny` 够不着，**服务端日志上一个字都没有**。
+# ⚠ 「客户端会回退」这条我们只在一家客户端上见过一次，**一次不构成通则**。
+# 改法不是去猜哪个客户端会怎样，是**不再赌**：`Accept` 本来就是客户端用来说
+# 「我认什么」的，照着它给。GET 那条长流对我们一条消息都不会走
+# （没有服务器主动推送的场景），它存在的意义只是「不让等它的人白等」。
 
 _HTTP_BODY_LIMIT = 10 * 1024 * 1024     # 单请求上限：正常一条 tools/call 远小于此
 # 被拒的请求最多吞多少 body 来保住 keep-alive（见 _drain）。超过就作废连接——
 # 声明了超大长度的客户端多半根本没打算发完，等它等于把线程挂死
 _HTTP_DRAIN_LIMIT = 64 * 1024
 _HTTP_DRAIN_TIMEOUT = 5.0
+# 被拒请求留痕的刷屏防线（见 _make_deny_logger）：一个窗口里最多逐条打多少行、
+# 窗口有多长。绑了 0.0.0.0 就会被扫，401/404 能刷满终端、撑爆重定向到的文件
+_HTTP_DENY_LOG_MAX = 60
+_HTTP_DENY_LOG_WINDOW = 60.0
+# GET 空长流：心跳间隔与并发上限。
+# ⚠ **心跳不是可选项**：手机运营商网络与反代（nginx `proxy_read_timeout` 默认 60s）
+# 会把长时间没有字节的连接静默掐掉，而「被掐掉」跟「服务端没实现」在客户端那头
+# 长得一模一样——正是这张卡在治的那种分不清。
+# ⚠ **上限也不是可选项**：ThreadingHTTPServer 一条连接一个线程，手机切后台/回前台
+# 反复重连会把线程堆起来，而这些线程各自都在 sleep，不会自己走
+_HTTP_SSE_HEARTBEAT = 15.0
+_HTTP_SSE_MAX_STREAMS = 4
+# 长流线程的轮询粒度：盯 socket 用，跟心跳无关。取小是为了 shutdown() 别拖
+_HTTP_SSE_POLL = 0.5
+# 405 的三句补注（见 _log_deny 的 note 参数）。**同一个状态码现在有三种含义**，
+# 不许再糊成一句：原来那句只在第一格是对的，另外两格照抄它就是把真故障说成不是故障
+_NOTE_405_FALLBACK = "客户端通常会自动改用 POST，这不是错误"
+_NOTE_405_OFF = ("SSE 长流被 --no-sse-stream 关掉了；"
+                 "客户端若不自动改用 POST，去掉这个开关")
+_NOTE_405_BUSY = f"SSE 长流已开满（上限 {_HTTP_SSE_MAX_STREAMS} 条），这一条没给"
+
+
+def _accept_set(header):
+    """把 `Accept` 头拆成 media type 集合（小写、去掉参数、`q=0` 的丢掉）。
+
+    ⚠ **没带头返回 `None`，不是空集合**：「客户端没说」与「说了但不要」
+    在 `do_GET` 里会走向**相反**的分支（没说 → 给长流，说了但不要 → 405），
+    合并成空集合就分不出来了。"""
+    if header is None:
+        return None
+    out = set()
+    for part in header.split(","):
+        bits = part.strip().split(";")
+        mt = bits[0].strip().lower()
+        if not mt:
+            continue
+        q = 1.0
+        for p in bits[1:]:
+            k, _, v = p.partition("=")
+            if k.strip().lower() == "q":
+                try:
+                    q = float(v.strip())
+                except ValueError:
+                    q = 1.0
+        if q > 0:
+            out.add(mt)
+    return out
+
+
+def _accept_has(types, mime):
+    """`_accept_set` 的结果里认不认这个 media type（含 `*/*` 与 `type/*`）。
+
+    `types is None`（客户端没带 `Accept`）一律返回 False——**「没说」不算「要」**，
+    要不要因此给它什么，由调用点自己判断。"""
+    if not types:
+        return False
+    return (mime in types or "*/*" in types
+            or f"{mime.split('/')[0]}/*" in types)
+
+
+def _log_sanitize(s, limit):
+    """要写进日志的那截字符串：不可打印字符换成 `?`，超长截断。
+
+    客户端能塞进请求行的东西不受我们控制（路径里放 `\\r\\n` 就能伪造出一整行
+    假日志，放几 KB 就能把终端顶满），而这行日志的用处正是让人一眼看清，
+    所以进日志前一律过这道。"""
+    s = "".join(ch if ch.isprintable() else "?" for ch in str(s))
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
+def _make_deny_logger():
+    """造一个「被拒请求留痕」的记录函数（每个 HTTP server 一份自己的计数器）。
+
+    **为什么要有它**（2026.08.04 立卡）：八种拒绝（401/403/404/405/411/413/400/501）
+    的原因 `_deny()` 每条都写得很清楚，但那句话只进**响应体**，而多数 MCP 客户端
+    不显示响应体，用户看到的是「Transport disconnected」之类的通用失败；服务端这边
+    `log_message` 整个静音，于是**两头都不说话，八种原因在用户那里长成同一个样子**。
+
+    ⚠ **`log_message` 的静音不掀掉**：它静音的理由（个人部署逐请求刷屏是纯噪声）
+    依然成立，这里只在它旁边开一个窄口子——**非 2xx 才留痕，正常请求照旧不打**。
+
+    刷屏防线：一个窗口里最多逐条打 `_HTTP_DENY_LOG_MAX` 行，超出的压掉。
+    ⚠ **压掉的条数必须说出来**——「压掉但不说」等于用一个新的静默去修一个旧的
+    静默，那就白做了。所以窗口结束时补一行「过去一分钟另有 X 条被拒未逐条列出」，
+    而且是**定时器兜底**：不能靠「下一个被拒请求来的时候顺手补」，那样一阵扫描
+    打完就没下文了的话，那 X 条就真的没人说了。
+    ⚠ ThreadingHTTPServer 是多线程的，计数器配自己的一把小锁（不复用 index 那把，
+    那把锁的是整段检索，等它等于把留痕挂在业务后面）。"""
+    lock = threading.Lock()
+    st = {"t0": None, "n": 0, "dropped": 0, "timer": None}
+
+    def _settle_locked():
+        """窗口翻页：清计数，返回要补打的那行（没压掉东西就 None）。调用方持锁。"""
+        if st["timer"] is not None:
+            st["timer"].cancel()
+            st["timer"] = None
+        dropped, st["dropped"] = st["dropped"], 0
+        st["t0"], st["n"] = None, 0
+        return f"过去一分钟另有 {dropped} 条被拒未逐条列出" if dropped else None
+
+    def _on_timeout():
+        with lock:
+            line = _settle_locked()
+        if line:
+            print(line, file=sys.stderr)
+
+    def emit(line):
+        out = []
+        with lock:
+            now = time.monotonic()
+            if st["t0"] is None or now - st["t0"] >= _HTTP_DENY_LOG_WINDOW:
+                closing = _settle_locked()
+                if closing:
+                    out.append(closing)
+                st["t0"], st["n"] = now, 0
+            if st["n"] < _HTTP_DENY_LOG_MAX:
+                st["n"] += 1
+                out.append(line)
+            else:
+                st["dropped"] += 1
+                if st["timer"] is None:
+                    t = threading.Timer(
+                        max(0.0, st["t0"] + _HTTP_DENY_LOG_WINDOW - now), _on_timeout)
+                    t.daemon = True      # 别让这只表拖住进程退出
+                    st["timer"] = t
+                    t.start()
+        for x in out:
+            print(x, file=sys.stderr)
+
+    return emit
+
+
+def _is_loopback(host):
+    """绑定地址是不是回环。`localhost` 走名字判断，其余按 IP 解析；解析不了的
+    （域名、空串）一律当非回环——**判不准时往严的那边倒**：那样守卫会要求 token、
+    横幅会多打一行提醒，两个方向的错都是"多提醒一次"，不是"漏掉一次"。"""
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host in ("localhost",)
+
+
+def http_tls_notice(host):
+    """非回环绑定时该多打的那一行（回环返回 None）。纯函数，起动横幅那边调。
+
+    **为什么要有这一行**（2026.08.04 外部实测促成）：`http_bind_guard` 挡的是
+    "非回环裸跑不配 token"，**它不挡"没有 TLS"**——配了 token 就照常起动，于是
+    用户走在一条裸 HTTP 暴露公网的路上，token 与 `latent_search` 返回的记忆内容
+    全程明文，而**没有任何人提醒过他**。那位用户自己提的建议是"检测到 token 已配
+    就提示绑定地址"，方向要反过来：token 已配说明他知道要鉴权，**真正没被提醒的
+    是 TLS**。
+
+    ⚠ **只提示，不拒绝起动**：拒绝会把"临时绑 `0.0.0.0` 验证一下"这条路堵死，
+    而那正是他这次定位根因的办法（怀疑过 SSE 格式、怀疑过桥接残留，最后是改绑定
+    地址才连上）。
+    ⚠ **不看 token**：token 与 TLS 是两件事，配了 token 也照样提醒——做成"有 token
+    就不提示"等于把唯一一次提醒的机会送给最不需要它的人。"""
+    if _is_loopback(host):
+        return None
+    return (f"⚠ 绑的是非回环地址（{host}）：这条链路没有 TLS，token 与 "
+            f"latent_search 返回的记忆内容在网上都是明文，拿到 token 的人既能读"
+            f"全库、也能写进去。推荐绑 127.0.0.1、公网那一跳交给反向代理"
+            f"（Caddy／nginx）管 TLS；只是临时验证的话，至少上防火墙限制来源，"
+            f"并把这个 token 当已经泄露过来处理。")
 
 
 def http_bind_guard(host, token):
@@ -501,11 +694,7 @@ def http_bind_guard(host, token):
                 "中文之类的口令客户端根本发不出去，而服务照样起得来——失败形态是"
                 "「看起来起来了、就是连不上」。换一串英文数字口令再起。")
         return
-    try:
-        loopback = ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        loopback = host in ("localhost",)
-    if not loopback:
+    if not _is_loopback(host):
         raise ValueError(
             f"拒绝在非回环地址（{host}）上裸跑：没配 token 的 HTTP 端口等于把记忆库"
             f"公开成既可读又可写。加 --token（或环境变量 MEMORY_HTTP_TOKEN），"
@@ -529,15 +718,31 @@ def _corpus_signature(corpus_dir):
     return tuple(out)
 
 
-def make_http_server(server, host="127.0.0.1", port=8765, token=None):
+def make_http_server(server, host="127.0.0.1", port=8765, token=None,
+                     sse_stream=True):
     """MemoryServer → 绑好端口的 ThreadingHTTPServer（不启动；.serve_forever() 是
-    调用方的事——selftest 要拿着实例开线程、取真端口、shutdown）。"""
+    调用方的事——selftest 要拿着实例开线程、取真端口、shutdown）。
+
+    `sse_stream`：GET 要不要给一条空长流（默认给，理由见上面那段注释）。
+    关掉就退回「GET 恒 405」的旧行为，留给「长流反而碍事」的部署。"""
     http_bind_guard(host, token)
     lock = threading.Lock()                  # index 的增删改建都不是线程安全的：串行化
+    deny_log = _make_deny_logger()           # 被拒请求留痕（带刷屏上限，见那个函数）
     state = {"sig": _corpus_signature(server.corpus_dir)
              if (server.corpus_dir and server.loader) else None}
+    # 开着的 GET 空长流：计数（配上限用）与「服务端要停了」的信号。
+    # ⚠ **`closing` 不能省**：长流线程平时蹲在 `wait(心跳间隔)` 上，没有这个信号
+    # 就得等一个心跳周期才发现服务停了——selftest 里 `shutdown()` 会跟着变慢，
+    # 真部署里 Ctrl-C 之后终端要挂十几秒
+    sse_lock = threading.Lock()
+    sse_open = {"n": 0}
+    closing = threading.Event()
 
     class _Server(http.server.ThreadingHTTPServer):
+        def shutdown(self):
+            closing.set()                    # 先叫长流线程收摊，再停 accept 循环
+            super().shutdown()
+
         def handle_error(self, request, client_address):
             """客户端中途断开不许喷 traceback（跟 log_message 静音同一个理由）。
 
@@ -607,7 +812,51 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None):
                     pass
             return True
 
-        def _deny(self, code, msg, extra=()):
+        def _log_deny(self, code, msg, note=None):
+            """被拒的请求在 stderr 上留一行（八条拒绝全走 `_deny`，所以落点只有这一处）。
+
+            形如：`被拒 404 GET /nope 来自 127.0.0.1：没有这个端点`
+            ——状态码、方法、**剥掉 query 的**路径、客户端 IP、原因短语。
+
+            `note` 是**调用点写死的一句常量补注**，原样缀在行尾（不过原因短语那道
+            截断）。⚠ **只许传常量，永远不许把客户端来的值塞进 `note`**——下面
+            三条硬边界与「变量插值放分隔符之后」那条规矩对它同样作数，而 `note`
+            恰恰绕过了截断这道保险。（服务端自己的配置常量算常量，
+            `_NOTE_405_BUSY` 里那个上限数字就是这么来的。）
+            目前唯一的调用点是 405（见 `do_GET`），但**同一个码有三种含义、
+            三句补注**（`_NOTE_405_FALLBACK` / `_NOTE_405_OFF` / `_NOTE_405_BUSY`）
+            ——只有第一种是「这不是错误」。
+
+            ⚠ **三条硬边界（「为了让人能排查」而写进日志，正好是明文那张卡在防的
+            事的另一个出口——日志会被重定向进文件、会被贴进 issue 找人帮看）**：
+
+            1. **`Authorization` 的任何内容都不打**，一个字符都不打。401 只记
+               「缺少或错误的 Bearer token」，不记收到的是什么——「只打前 4 位帮
+               用户对一下」也不行。
+            2. **不打请求体**。400「请求体不是合法的 UTF-8 JSON」时最想附上的就是
+               那段 body，**恰恰最不能附**：那里面是 `latent_search` 的问句和
+               `latent_append` 的正文，是用户最私密的记忆。413 同理。
+            3. **路径剥掉 query string**：`_deny(404, ...)` 把整个 `self.path` 回给
+               对方没问题（是他自己发的），但**写进日志就落盘了**，而有些客户端
+               习惯把 token 塞 `?token=`。所以这里用 `urlsplit(self.path).path`，
+               **不用 `self.path`**。
+
+            原因短语取 `msg` 的**第一个分隔符之前**那截：各调用点把客户端来的值
+            （路径、Origin、`Transfer-Encoding` 的值）都插在分隔符之后，切掉即可。
+            ⚠ **以后新增 `_deny` 调用点，变量插值必须放在「：」「: 」「——」之后**，
+            否则它会跟着原因短语进日志。"""
+            reason = msg
+            for sep in ("：", ": ", "——", "\n"):
+                reason = reason.split(sep, 1)[0]
+            path = urllib.parse.urlsplit(self.path).path
+            ip = self.client_address[0] if self.client_address else "?"
+            deny_log(f"被拒 {code} {_log_sanitize(self.command or '?', 16)} "
+                     f"{_log_sanitize(path, 120)} 来自 {_log_sanitize(ip, 60)}："
+                     f"{_log_sanitize(reason, 80)}"
+                     + (f"（{note}）" if note else ""))
+
+        def _deny(self, code, msg, extra=(), note=None):
+            self._log_deny(code, msg, note=note)
             extra = list(extra)
             if not self._drain():
                 self.close_connection = True
@@ -639,11 +888,75 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None):
                     return False
             return True
 
+        def _sse_idle_stream(self):
+            """一条只发心跳、永不发消息的 SSE 长流，直到对端走人或服务端要停。
+
+            **不带 Content-Length、也不 chunked**，所以这条连接是「读到关闭为止」
+            的——必须显式 `close_connection`，否则 keep-alive 那套会跟它打架
+            （HTTP/1.1 下没有长度又不关连接，客户端会一直等下一条响应的头）。
+
+            **首字节 `: ok` 立刻发**：给客户端一个「流真的建起来了」的凭据。
+            差这一下的话，「建好了但没消息」跟「还在连」在客户端那头分不出来，
+            而分不出来正是这张卡在治的病。`:` 开头是 SSE 的注释行，
+            任何合规的解析器都会安静地丢掉它，不会被当成一条消息。
+
+            ⚠ **不能只蹲在「睡够一个心跳再写一次」上**（第一版就是那么写的）：
+            对端断开之后，这条线程要等到下一次心跳写失败才发现，
+            名额（`_HTTP_SSE_MAX_STREAMS`）跟着被占住一整个心跳周期。手机切后台／
+            回前台反复重连时，客户端看到的就是**明明没人在用却回 405**。
+            所以这里同时盯着三样：socket 可读（对端关了写端＝走人）、心跳到点、
+            服务端要停——轮询粒度取心跳与 `_HTTP_SSE_POLL` 的较小者。"""
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            sock = self.connection
+            try:
+                self.wfile.write(b": ok\n\n")
+                self.wfile.flush()
+                last = time.monotonic()
+                while not closing.is_set():
+                    poll = min(_HTTP_SSE_POLL, _HTTP_SSE_HEARTBEAT)
+                    ready, _, _ = select.select([sock], [], [], poll)
+                    if ready:
+                        # 空读＝对端关了写端，这条流没人要了，立刻把名额还回去。
+                        # 读到东西反倒不算断开（不该有，但忽略掉比误判成断开安全）
+                        if not sock.recv(4096):
+                            break
+                        continue
+                    now = time.monotonic()
+                    if now - last >= _HTTP_SSE_HEARTBEAT:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                        last = now
+            except OSError:
+                pass          # 对端走了：正常收场，不是异常（同 handle_error 的理由）
+
         def do_GET(self):
             if not self._gate():
                 return
-            self._deny(405, "本 server 不提供 SSE 长流，请用 POST（Streamable HTTP）",
-                       extra=[("Allow", "POST, DELETE")])
+            deny = ("本 server 不提供 SSE 长流，请用 POST（Streamable HTTP）",
+                    [("Allow", "POST, DELETE")])
+            if not sse_stream:
+                return self._deny(405, deny[0], extra=deny[1], note=_NOTE_405_OFF)
+            # ⚠ 「没带 Accept」与「带了但不要 SSE」必须分开判，别图省事合并：
+            # 前者是懒客户端，没说要什么、却多半正等着长流；
+            # 后者明确说了只收 JSON，给它长流反而是把一条本来好的路弄坏。
+            types = _accept_set(self.headers.get("Accept"))
+            if not (types is None or _accept_has(types, "text/event-stream")):
+                return self._deny(405, deny[0], extra=deny[1], note=_NOTE_405_FALLBACK)
+            with sse_lock:
+                if sse_open["n"] >= _HTTP_SSE_MAX_STREAMS:
+                    return self._deny(405, "SSE 长流已开满，请用 POST（Streamable HTTP）",
+                                      extra=deny[1], note=_NOTE_405_BUSY)
+                sse_open["n"] += 1
+            try:
+                self._sse_idle_stream()
+            finally:
+                with sse_lock:
+                    sse_open["n"] -= 1
 
         def do_DELETE(self):
             if not self._gate():
@@ -688,7 +1001,7 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None):
                 # 常驻形态的重读：语料目录文件级变化（手动上传/删除 md）→ 从盘重建。
                 # ⚠ **指纹要在 handle 之后重算、而且只认自己写的那次变化**
                 # （2026.08.03 外部评审指出的竞态）：原先 handle 后无条件刷新指纹，
-                # 于是「一次 memory_append 与用户手动上传落在同一个请求窗口」时，
+                # 于是「一次 latent_append 与用户手动上传落在同一个请求窗口」时，
                 # 那次上传会被自己的刷新永久吞掉、再也不触发重读——正好是这个特性
                 # 要治的静默形态。改法：handle 前后各取一次，**只把 server 自己写回
                 # 造成的差异并进基线**（after 与 before 的差集里属于自己写回的部分
@@ -704,7 +1017,7 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None):
                 if state["sig"] is not None and server.written_paths:
                     # **只折进 server 自己写的那几个文件**，其余差异留着让下一个
                     # 请求去发现——手动上传就落在"其余"里，不会被自己的刷新吞掉。
-                    # 顺带：只读请求（memory_search 是绝大多数）written_paths 是空的，
+                    # 顺带：只读请求（latent_search 是绝大多数）written_paths 是空的，
                     # 这里整个跳过，不再每个请求 stat 全库两遍
                     base = {p: (m, s) for p, m, s in state["sig"]}
                     for p, m, s in _corpus_signature(server.corpus_dir):
@@ -713,9 +1026,25 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None):
                     state["sig"] = tuple(sorted((p, m, s) for p, (m, s) in base.items()))
                     server.written_paths = set()
             if resp is None:
-                self._send(202)              # 通知：202 空身（规格）
+                return self._send(202)       # 通知：202 空身（规格）
+            body = json.dumps(resp, ensure_ascii=False).encode("utf-8")
+            # 规格允许服务器对 POST 回 JSON 或回 SSE，二选一。默认 JSON，
+            # **只在客户端明确只要 SSE 时**才包成单事件 SSE——有的客户端解析器
+            # 只会拆 `event:/data:`，收到 application/json 就接不上，而这一格
+            # 是 2xx，`_deny` 够不着，服务端日志上一个字都没有。
+            # ⚠ **回归护栏**：`Accept` 里同时有 application/json（规格要求客户端
+            # 两个都写）、或有 `*/*`、或压根没带头，一律照旧回 JSON。已经跑通的
+            # 客户端一个都不许被这条带坏——判据 2、3 守着这句话。
+            types = _accept_set(self.headers.get("Accept"))
+            if (_accept_has(types, "text/event-stream")
+                    and not _accept_has(types, "application/json")):
+                # 单事件 SSE：发完这一条就把流收了（规格说响应发完即可关流），
+                # 所以照旧带 Content-Length，keep-alive 不受影响
+                self._send(200, b"event: message\ndata: " + body + b"\n\n",
+                           ctype="text/event-stream; charset=utf-8",
+                           extra=[("Cache-Control", "no-store")])
             else:
-                self._send(200, json.dumps(resp, ensure_ascii=False).encode("utf-8"))
+                self._send(200, body)
 
     return _Server((host, port), _Handler)
 
@@ -753,7 +1082,7 @@ _MTIME_WARN_RATIO = 0.2
 _HEADING_ONLY_WARN_RATIO = 0.5
 
 
-def diagnose(corpus_dir, threads_path=None, embed=False):
+def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None):
     """体检语料目录与接线，返回 [{level,title,detail}, ...]。**纯读，不写盘。**
 
     检的是"配好了没有"，不是"检索好不好"——后者归回归集（regression_set.py）。
@@ -932,18 +1261,18 @@ def diagnose(corpus_dir, threads_path=None, embed=False):
             add(OK, name, f"{what}接上 {n} 块，无孤儿条目")
     index.build()                       # 实体边在 build 时算，接上后要重建一次
 
-    # 写回落点：memory_append/memory_correct 要往这里写。只用 os.access 判，
+    # 写回落点：latent_append/latent_correct 要往这里写。只用 os.access 判，
     # 不试写——试写就破了只读
     if os.access(root, os.W_OK):
         # 落点要报到层：写回永远进 timeline 层（append_record 构造上锁死的），
         # 人格文件里「按需读取指针」必须盖住这个目录——用户拿这行对自己的指针，
         # 指漏了的症状是"新长出来的记忆按需读不到"，而且不报错
-        add(OK, "写回落点", f"{root}/timeline 可写（memory_append 按窗口号+日期"
+        add(OK, "写回落点", f"{root}/timeline 可写（latent_append 按窗口号+日期"
             f"往这里加文件；人格文件的「按需读取指针」要盖住这个目录）")
     else:
         add(FAIL, "写回落点", f"{root} 不可写——模型会说“记下了”，但每一次写回都失败。")
 
-    # thread 落点：没配 --threads 时 thread_close 只活在内存里，进程一退就没了，
+    # thread 落点：没配 --threads 时 latent_thread_close 只活在内存里，进程一退就没了，
     # 下个会话的开场召回接不上上一次聊到哪
     if not threads_path:
         add(WARN, "会话线索", "没配 --threads，会话收尾只在内存里、进程一退就没——"
@@ -953,7 +1282,7 @@ def diagnose(corpus_dir, threads_path=None, embed=False):
         if not tp.exists():
             writable = tp.parent.exists() and os.access(tp.parent, os.W_OK)
             add(OK if writable else FAIL, "会话线索",
-                f"{tp} 还没有（第一次 thread_close 时创建）"
+                f"{tp} 还没有（第一次 latent_thread_close 时创建）"
                 + ("" if writable else "，但它的父目录不存在或不可写，创建会失败。"))
         else:
             try:
@@ -974,9 +1303,28 @@ def diagnose(corpus_dir, threads_path=None, embed=False):
                               "上面关于语料/时间戳/sidecar 的结论跟检索路线无关，照样作数；"
                               "embed 那一路通不通请直接起一次服务看。")
 
+    # 时区：**没配的那一档必须报出来**（任务卡"写回时区与跨日归窗"）。它是这份报告里
+    # 最典型的"不报错的失败"——服务照起、工具照返回成功，只是每天凌晨那几个小时写下的
+    # 记忆被记成前一天，而错误日期会进文件名、H2、检索标签和重启后的排序信号。
+    # ⚠ 报的是**实际在用的那个时区名**，不是"没配"三个字：用户要能一眼看出
+    # 服务器认的是不是他自己那个时区（事故现场服务器认的是 Etc/UTC，用户在东八区）。
+    # ⚠ **没配那一档仍然报 ⚠，哪怕默认值已经改成东八区**（2026.08.05 维护者拍板）：
+    # 默认值对东八区以外的使用者就是错的，而且照样不报错——这一格是它唯一会露头的
+    # 地方。⚠ 别把它降成 ✓：那等于让报告对着"可能不对的日期"打合格证。
+    tc = time_context if time_context is not None else TimeContext.default()
+    if tc.explicit:
+        add(OK, "时区", f"{tc.name}——自然日按这个时区的 00:00～23:59 算，"
+                        "写回、归窗、检索标签同一个口径")
+    else:
+        add(WARN, "时区", f"没配 --timezone，用的是默认值 {tc.name}（东八区）。"
+                          "你就在东八区的话这条可以不管；**不在的话现在写下的记忆"
+                          "日期是错的**，且不报错——文件名、记录标题、检索标签和重启后"
+                          "的新鲜度信号会一起错。在 MCP 配置里补一行 "
+                          "--timezone <你的 IANA 时区>（例如 Europe/Berlin）。")
+
     # 接线本身：握手 + 工具表 + 一次真检索。前面全绿也可能死在这一步，
     # 而这是唯一一处能证明"这份语料真能被查到"的检查
-    srv = MemoryServer(index=index, thread_store=ThreadStore(threads_path))
+    srv = MemoryServer(index=index, thread_store=ThreadStore(threads_path), time_context=tc)
     #    ⚠ 故意不接 weights_path：接了的话下面这次检索会把权重落盘，体检就不再只读。
     #    要改这行之前先读 selftest 第 14 项——它就是守这个的。
     hs = srv.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
@@ -986,7 +1334,7 @@ def diagnose(corpus_dir, threads_path=None, embed=False):
 
     probe = _doctor_probe(index)
     res = srv.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                      "params": {"name": "memory_search",
+                      "params": {"name": "latent_search",
                                  "arguments": {"query": probe}}})["result"]
     if res["isError"]:
         add(FAIL, "检索自查", f"拿语料自己的标题“{probe}”去查，反而查不到："
@@ -1028,6 +1376,236 @@ def format_doctor_report(checks):
     return "\n".join(lines)
 
 
+# ---------- 启动失败：给人话、给出口、让用户真的看得见（任务卡"服务端起不来时全是裸堆栈"） ----------
+#
+# **病在哪**（2026.08.05 维护者本人走完一遍 Operit 接入，一条一条撞出来的）：
+# `mcp_server.py` 起不来时全是裸 Python 堆栈，而 stdio 形态下**客户端只显示
+# 「连接失败」四个字，那段堆栈用户根本看不到**——手上没有任何下一步。
+# 跟《出货闸报错不带出口》是同一个病搬到启动层，而且更严重：出货闸至少把报错
+# 打在用户眼前，这里连打都打不出来。
+#
+# **修法（2026.08.06 维护者拍板：协议降级壳 ＋ 文件留痕）**：
+# 1. **协议降级壳**——stdio 档启动失败时不直接死，改起一个「只会说这一句话」的
+#    最小 server（`StartupFailureServer`）：照常回 `initialize`，人话进 `instructions`；
+#    任何 `tools/call` 一律 `isError=true` 回同一句话。这是**唯一不依赖客户端实现、
+#    在 Operit 和 Claude Code 上都能进用户眼**的路径——stderr 那条路已经证明进不去。
+# 2. **文件留痕**——同一句话连同完整堆栈写进 `startup_log_path()`，横幅与人话都指这条路。
+#
+# ⚠ **降级壳不是变相放宽检查**（任务卡第五节第一条）：它**一个真工具都不提供**，
+# `tools/list` 只有 `memory_startup_error` 一个诊断工具，任何调用都失败。
+# 检查该拒还是拒了，改的只是**拒绝怎么说话**。谁以后想往这个壳里塞一个"能用的"
+# 工具当降级服务，那就是这张卡明确禁止的事。
+#
+# ⚠ **这一节管不到「用户真的看见了没有」**：那要拿真客户端故意造一次失败、看它
+# 界面上出现了什么（任务卡靶心二）。**我们在终端里看到了不算**——终端是我们的
+# 视角，不是用户的。
+
+# 慢加载提示的两道门槛（秒）。第一道给"是不是卡死了"一个答复，第二道让久等的人
+# 知道进程还活着。⚠ 只提示，**不改加载时序**（任务卡靶心四：改成全异步/懒加载会
+# 把可见的慢换成不可见的慢——握手秒回、第一次 latent_search 卡死，更糟）。
+_SLOW_LOAD_NOTICE_SECONDS = (5.0, 30.0)
+
+# 启动失败报告落盘的目录，可用环境变量顶掉（容器里 HOME 可能不可写）
+STARTUP_LOG_DIR_ENV = "MEMORY_MCP_LOG_DIR"
+
+
+def startup_log_path():
+    """启动失败报告写哪儿：`$MEMORY_MCP_LOG_DIR`／默认 `~/.memory-mcp`。
+
+    ⚠ **刻意不落在 `--corpus` 目录下**：第 1 条（语料/模型加载失败）里那个目录
+    本身就可能是出问题的一方，而且语料目录是**会被同步、会被贴给别人看**的地方，
+    堆栈里带着本机路径。"""
+    base = os.environ.get(STARTUP_LOG_DIR_ENV) or (Path.home() / ".memory-mcp")
+    return Path(base) / "last-startup-error.log"
+
+
+def _looks_offline(exc):
+    """这个异常是不是「拉不到模型」那一类（没网／下不动／库没装）。
+
+    ⚠ **只在 embed 档的加载阶段问这句话**——分档主要靠**出错在哪个阶段**
+    （加载 vs 绑端口），不靠翻异常文本，这样第 1 条与第 3 条不可能串。
+    这里问的是加载阶段内部的第二层：是"拿不到模型"还是"语料本身有问题"。"""
+    for e in (exc, exc.__cause__, exc.__context__):
+        if e is None:
+            continue
+        if isinstance(e, (socket.gaierror, TimeoutError)):
+            return True
+        if isinstance(e, OSError) and e.errno in (
+                errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ECONNREFUSED,
+                errno.ETIMEDOUT, errno.ENETDOWN):
+            return True
+        if isinstance(e, ImportError):
+            # fastembed/onnxruntime 没装：跟没网是同一条出口（先联网备好这一档）
+            return True
+        name = type(e).__name__
+        if name in ("ConnectError", "ConnectTimeout", "ReadTimeout", "ProxyError",
+                    "RequestError", "TransportError", "SSLError", "HTTPError",
+                    "ConnectionError", "MaxRetryError", "NewConnectionError",
+                    "URLError"):
+            return True
+        text = str(e)
+        for probe in ("Network is unreachable", "Temporary failure in name resolution",
+                      "Max retries exceeded", "Failed to establish a new connection",
+                      "getaddrinfo failed", "Name or service not known"):
+            if probe in text:
+                return True
+    return False
+
+
+def startup_failure_report(stage, exc, *, embed=False, http_bind=None, log_path=None):
+    """把一次启动失败翻成「一句人话 ＋ 一条可照抄的出口」。
+
+    `stage` 只有两个值，对应任务卡那张表里仍然作数的两条**失败**路径：
+      - `"load"`  → 建索引/加载语料这一段（第 1 条在这里）
+      - `"bind"`  → `--http` 绑端口这一段（第 3 条在这里）
+    （表里第 4 条「语料很大时像卡死」不是失败，走 `slow_load_notice`；
+    ⚠ **编号按任务卡那张表，故意不重排**——②虽已划掉也不把③④提上来，
+    重排会让别处对「②」的引用悄悄指向另一条。）
+
+    返回一段多行文本，第一行是人话、第二行是出口，末行指向落盘的完整堆栈。"""
+    if stage == "bind" and isinstance(exc, OSError) and exc.errno == errno.EADDRINUSE:
+        why = f"要监听的地址已经被别的进程占着，起不来（{http_bind}）。"
+        how = ("出口：换一个端口重起（例如 --http 127.0.0.1:8766），"
+               "或者先把占着这个端口的进程停掉再重起"
+               "（Linux/macOS：lsof -i :<端口>；Windows：netstat -ano | findstr :<端口>）。")
+    elif stage == "load" and embed and _looks_offline(exc):
+        why = "这台机器上没有现成的 embedding 模型，而现在也下不下来（没网或下载被挡）。"
+        how = ("出口：二选一——①连上网再起一次，让它把模型下完（只需一次，之后离线可用）；"
+               "②不想下模型就重跑 python memory_init.py --step route --route zero-dep，"
+               "让它重新生成客户端配置。"
+               "⚠ 不要自己把配置里的 --embed 删掉：--embed 必须跟 init_state 记的检索路线一致，"
+               "手删参数是隐患，正确出口是重跑 --step route。")
+    elif stage == "load":
+        why = "语料读不进来，索引没建起来（--corpus 指的目录不对、读不了，或里面的文件有问题）。"
+        how = ("出口：把同一行参数里的 --http/--threads 都留着、"
+               "把命令换成 python mcp_server.py --doctor --corpus <同一个目录> 跑一次，"
+               "体检只读不写盘，会逐项说清哪一项过不去。")
+    else:
+        why = "服务端在启动阶段失败了。"
+        how = ("出口：python mcp_server.py --doctor --corpus <同一个目录> 跑一次体检，"
+               "再看下面那份完整报错。")
+    lines = ["记忆协议服务端没能起来。",
+             f"原因：{why}",
+             how,
+             f"（技术细节：{type(exc).__name__}: {exc}）"]
+    if log_path is not None:
+        lines.append(f"完整报错已经写进 {log_path}，排查时把那个文件贴出来即可。")
+    return "\n".join(lines)
+
+
+def write_startup_log(report, exc, path=None):
+    """把人话和完整堆栈一起落盘，返回落点；写不进去就返回 None（**不许因此再崩一次**）。
+
+    ⚠ 写失败必须吞掉：这段代码只在"已经失败了"的路径上跑，让它自己抛异常
+    等于把用户仅剩的那句人话也弄丢——正是这张卡在治的形状。"""
+    path = Path(path) if path is not None else startup_log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(_dt_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"# 记忆协议 MCP server 启动失败（{stamp}）\n\n{report}\n\n")
+            f.write("--- 完整堆栈（给排查用，上面那几行才是给你看的）---\n")
+            f.write("".join(traceback.format_exception(
+                type(exc), exc, exc.__traceback__)))
+        return path
+    except OSError:
+        return None
+
+
+def slow_load_notice(stream=None, thresholds=_SLOW_LOAD_NOTICE_SECONDS):
+    """加载慢过门槛就说一句话，返回一个「加载完了叫我」的取消函数。
+
+    治的是任务卡那张表**第 4 条**：语料很大时握手前要先把全库读完建索引，
+    这段时间里进程一声不吭，看起来跟卡死一模一样，客户端只会超时。
+
+    ⚠ **这一轮只做到「慢的时候有话说」**（靶心四，防过度纠正）：
+    不把加载改成全异步/懒加载——那样握手秒回、第一次 `latent_search` 卡死，
+    是把可见的慢换成不可见的慢。真要改加载时序另开卡。
+
+    ⚠ **这句话走 stderr，因此在 stdio 形态下用户多半看不到**——这跟降级壳
+    （失败路径）不是一回事：第 4 条最终是"加载完了、能起来"，协议流那时才开始，
+    没有一个既不撒谎又能提前说话的口子。别把这条读成"第 4 条也解决了可见性"。"""
+    stream = stream or sys.stderr
+    timers = []
+
+    def say(text):
+        print(text, file=stream)
+        try:
+            stream.flush()
+        except (ValueError, OSError):
+            pass
+
+    first, second = thresholds
+    timers.append(threading.Timer(first, say, args=(
+        "正在读语料建索引……语料多的时候这一步要花点时间，进程没有卡死，请再等等。",)))
+    timers.append(threading.Timer(second, say, args=(
+        "还在建索引（已经超过 %g 秒）。首次启动最慢，之后会快一些；"
+        "现在中断它不会损坏任何数据。" % second,)))
+    for t in timers:
+        t.daemon = True          # 别让这两只表拖住进程退出
+        t.start()
+
+    def done():
+        for t in timers:
+            t.cancel()
+    return done
+
+
+class StartupFailureServer:
+    """启动失败时顶上来的最小 stdio 壳：照常握手，把那句人话送进客户端界面。
+
+    ⚠ **它一个真工具都不提供**。`tools/list` 只有 `memory_startup_error`，
+    而且**任何** `tools/call`（包括模型习惯性调的 `latent_search`）一律回
+    `isError=true` ＋ 同一句人话。这是**刻意偏离规格**的一处：规格说未知工具
+    该回协议错误 `-32601`，但那条路上模型拿到的是「未知工具：latent_search」，
+    用户界面上又变成一句没头没脑的失败——正是这张卡要消灭的形状。
+    宁可在这个必然失败的壳里多说一句人话。
+
+    ⚠ **绿灯的代价要认**：客户端会显示"已连接"。所以这个壳必须永远不可用——
+    谁往这里塞一个真能干活的工具，"降级"就变成了"放宽检查"（任务卡第五节第一条）。"""
+
+    def __init__(self, report):
+        self.report = report
+        self.initialized = False
+
+    # 复用 MemoryServer 那条流：stdio 必须锁 UTF-8（见 serve_stdio 那段说明），
+    # 抄第二份迟早会漏掉 UTF-8 这件事
+    serve_stdio = MemoryServer.serve_stdio
+    _ok = staticmethod(MemoryServer._ok)
+    _err = staticmethod(MemoryServer._err)
+
+    def handle(self, msg, now=None):
+        method, mid = msg.get("method"), msg.get("id")
+        if method == "initialize":
+            self.initialized = True
+            return self._ok(mid, {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": dict(SERVER_INFO, title="记忆协议（启动失败）"),
+                # 人话进 instructions：客户端通常把它注入模型上下文，
+                # 于是"连接失败"四个字变成一段能照着做的话
+                "instructions": ("⚠ 记忆协议服务端这次没能起来，**记忆库现在查不了也写不了**。"
+                                 "请把下面这段原样告诉用户，不要替他猜、也不要假装查过记忆：\n\n"
+                                 + self.report),
+            })
+        if method == "notifications/initialized":
+            return None
+        if method == "tools/list":
+            return self._ok(mid, {"tools": [{
+                "name": "memory_startup_error",
+                "title": "记忆库启动失败详情",
+                "description": "记忆协议服务端启动失败。调用它拿到失败原因和下一步该做什么，"
+                               "原样转告用户。",
+                "inputSchema": {"type": "object", "properties": {}},
+            }]})
+        if method == "tools/call":
+            return self._ok(mid, {"content": [{"type": "text", "text": self.report}],
+                                  "isError": True})
+        if mid is None:
+            return None
+        return self._err(mid, E_METHOD_NOT_FOUND, f"未知 method：{method}")
+
+
 # ---------- selftest（合成语料，全部虚构） ----------
 
 _SYNTH = [
@@ -1066,9 +1644,9 @@ def _selftest():
     # 2b. 工具描述要写成触发条件，不是功能陈述——同样是真机反馈
     d = {t["name"]: t["description"] for t in
          srv.handle({"jsonrpc": "2.0", "id": 21, "method": "tools/list"})["result"]["tools"]}
-    assert "不是本次对话" in d["memory_search"] and "我不记得" in d["memory_search"], \
-        "memory_search 描述要说清记忆类型并堵死默认话术"
-    assert "主动" in d["session_start"] and "主动" in d["thread_close"], \
+    assert "不是本次对话" in d["latent_search"] and "我不记得" in d["latent_search"], \
+        "latent_search 描述要说清记忆类型并堵死默认话术"
+    assert "主动" in d["latent_session_start"] and "主动" in d["latent_thread_close"], \
         "两个生命周期工具要写明主动调用，不用等对方要求"
     #    initialized 是通知，不能回响应（回了客户端会当成野生响应）
     assert srv.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None, \
@@ -1076,9 +1654,9 @@ def _selftest():
 
     # 2. tools/list：三个工具，schema 字段名照规格（name/inputSchema）
     tools = srv.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
-    assert [t["name"] for t in tools] == ["memory_search", "session_start",
-                                          "memory_append", "memory_correct",
-                                          "thread_close"]
+    assert [t["name"] for t in tools] == ["latent_search", "latent_session_start",
+                                          "latent_append", "latent_correct",
+                                          "latent_thread_close"]
     for t in tools:
         assert set(t) >= {"name", "description", "inputSchema"} and t["inputSchema"]["type"] == "object"
     assert tools[4]["inputSchema"]["required"] == ["window", "current_state"], "当下状态必填要写进 schema"
@@ -1091,7 +1669,7 @@ def _selftest():
     def call(name, args=None, mid=9):
         return srv.handle({"jsonrpc": "2.0", "id": mid, "method": "tools/call",
                            "params": {"name": name, "arguments": args or {}}}, now=now)
-    res = call("memory_search", {"query": "咖啡机坏了"})["result"]
+    res = call("latent_search", {"query": "咖啡机坏了"})["result"]
     assert res["isError"] is False and res["content"][0]["type"] == "text"
     assert "保险丝熔断" in res["content"][0]["text"]
 
@@ -1104,14 +1682,14 @@ def _selftest():
     #    2026.08.01 随缺失率标注放宽了一格，但**纪律没放松**：比对的仍是"底层库
     #    函数的组合结果"（annotate_block(format_recall_block(...), 缺失率)），
     #    外壳只要自己拼一个字都会红
-    assert call("memory_search", {"query": "咖啡机坏了"}, mid=10)["result"]["content"][0]["text"] \
-        == expected_search, "memory_search 必须原样返回底层库函数的组合结果，外壳不许自拼"
+    assert call("latent_search", {"query": "咖啡机坏了"}, mid=10)["result"]["content"][0]["text"] \
+        == expected_search, "latent_search 必须原样返回底层库函数的组合结果，外壳不许自拼"
     srv2 = _build_server(now)
     expected_start = srv2.recall.on_session_start(now=now)
     assert srv2.handle({"jsonrpc": "2.0", "id": 11, "method": "tools/call",
-                        "params": {"name": "session_start"}}, now=now
+                        "params": {"name": "latent_session_start"}}, now=now
                        )["result"]["content"][0]["text"] == expected_start, \
-        "session_start 必须原样返回 on_session_start 的结果"
+        "latent_session_start 必须原样返回 on_session_start 的结果"
 
     # 5.【变异靶心·错误分层】未知工具→协议错误；工具内部失败→isError 结果
     unknown = call("no_such_tool")
@@ -1120,27 +1698,27 @@ def _selftest():
     assert unknown["error"]["code"] == E_METHOD_NOT_FOUND
     empty_srv = MemoryServer(index=MemoryIndex().build())
     r5 = empty_srv.handle({"jsonrpc": "2.0", "id": 12, "method": "tools/call",
-                           "params": {"name": "session_start"}}, now=now)
+                           "params": {"name": "latent_session_start"}}, now=now)
     assert "result" in r5 and r5["result"]["isError"] is True, \
         f"工具执行失败该回 isError 结果而不是协议错误——模型要看得到失败原因：{r5}"
     #    参数非法（缺 query）同样走 isError，不是崩
-    assert call("memory_search", {})["result"]["isError"] is True
+    assert call("latent_search", {})["result"]["isError"] is True
     #    arguments 不是对象 → 协议错误
     bad = srv.handle({"jsonrpc": "2.0", "id": 13, "method": "tools/call",
-                      "params": {"name": "memory_search", "arguments": "字符串"}})
+                      "params": {"name": "latent_search", "arguments": "字符串"}})
     assert bad["error"]["code"] == E_INVALID_PARAMS
 
-    # 6. thread_close 真写进 store，且下一次 session_start 能带回来（一条完整链路）
-    ok = call("thread_close", {"window": 7, "current_state": "花买好了，周末的事没定。",
+    # 6. latent_thread_close 真写进 store，且下一次 latent_session_start 能带回来（一条完整链路）
+    ok = call("latent_thread_close", {"window": 7, "current_state": "花买好了，周末的事没定。",
                                "topics": ["阳台的花"], "open_loops": ["周末去哪还没定"],
                                "started_at": now - 3600})
     assert ok["result"]["isError"] is False and "第 7 个窗口" in ok["result"]["content"][0]["text"]
     assert srv.thread_store.latest().window == 7
-    started = call("session_start")["result"]["content"][0]["text"]
+    started = call("latent_session_start")["result"]["content"][0]["text"]
     assert started.startswith("【上次会话】") and "周末去哪还没定" in started, \
-        "thread_close 写的东西该被下一次 session_start 带回来"
+        "latent_thread_close 写的东西该被下一次 latent_session_start 带回来"
     #    当下状态为空 → 业务校验拦下，走 isError（病灶迁移纪律穿透到协议层）
-    assert call("thread_close", {"window": 8, "current_state": "  "})["result"]["isError"] is True
+    assert call("latent_thread_close", {"window": 8, "current_state": "  "})["result"]["isError"] is True
 
     # 7. 未知 method 走协议错误；未知通知（无 id）静默忽略，不回野生错误
     assert srv.handle({"jsonrpc": "2.0", "id": 14, "method": "resources/list"}
@@ -1167,7 +1745,7 @@ def _selftest():
     assert _utf8_text_stream(io.BytesIO(b"")).encoding == "utf-8", "stdio 必须锁死 UTF-8"
     srv4 = _build_server(now)
     payload = ('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":'
-               '{"name":"memory_search","arguments":{"query":"薄荷"}}}\n')
+               '{"name":"latent_search","arguments":{"query":"薄荷"}}}\n')
     out4 = io.BytesIO()
     #    两个包装流都要留引用：被 GC 掉时 TextIOWrapper 会顺手关掉底层 BytesIO
     in_s = _utf8_text_stream(io.BytesIO(payload.encode("utf-8")))
@@ -1178,7 +1756,7 @@ def _selftest():
     assert got["result"]["isError"] is False and "薄荷" in got["result"]["content"][0]["text"], \
         f"中文 query 该原样穿过 stdio 并命中，实际 {got}"
 
-    # 9.【变异靶心：写回当场可查 + 没落点明确拒写】memory_append 是记忆库自己
+    # 9.【变异靶心：写回当场可查 + 没落点明确拒写】latent_append 是记忆库自己
     #    生长的那半支笔（thread 是会话状态层，这是正文层）
     import tempfile
     from pathlib import Path as _P
@@ -1187,22 +1765,22 @@ def _selftest():
          "params": {"name": name, "arguments": a}}, now=n)["result"]
     #    没配语料目录：明确 isError，不静默写进内存了事（内存态的"记住了"会随
     #    进程一起死，那是"失败得像成功"）
-    r9 = call(srv, "memory_append",
+    r9 = call(srv, "latent_append",
               {"text": "x", "current_state": "y"}, now)
     assert r9["isError"] is True and "语料目录" in r9["content"][0]["text"]
     with tempfile.TemporaryDirectory() as td:
         srv9 = MemoryServer(index=MemoryIndex().build(), thread_store=ThreadStore(),
                             corpus_dir=td, weights_path=_P(td) / ".weights.json")
         #    缺当下状态 → isError（病灶迁移在写入口强制），且没有文件落盘
-        bad = call(srv9, "memory_append", {"text": "她说了件事"}, now)
+        bad = call(srv9, "latent_append", {"text": "她说了件事"}, now)
         assert bad["isError"] is True and "当下状态" in bad["content"][0]["text"]
         assert not list(_P(td).glob("**/*.md")), "被拒的写回不该留下文件"
         #    正常写回 → 落盘 + 本会话立刻可查（不重建索引就查不到）
-        ok9 = call(srv9, "memory_append",
+        ok9 = call(srv9, "latent_append",
                    {"text": "约好周末去看鲸头鹳，她念叨了一个月。",
                     "current_state": "约定成立，票还没买。"}, now)
         assert ok9["isError"] is False and "第 1 个窗口" in ok9["content"][0]["text"]
-        hit = call(srv9, "memory_search", {"query": "鲸头鹳"}, now)
+        hit = call(srv9, "latent_search", {"query": "鲸头鹳"}, now)
         assert hit["isError"] is False and "约定成立" in hit["content"][0]["text"], \
             "写回之后当场就要能查到——不然模型刚说'记下了'转头就'没有记录'"
 
@@ -1214,7 +1792,7 @@ def _selftest():
                                   thread_store=ThreadStore(),
                                   corpus_dir=td, weights_path=wp)
         s_a = mk()
-        call(s_a, "memory_search", {"query": "薄荷"}, now)     # 命中 → 权重落盘
+        call(s_a, "latent_search", {"query": "薄荷"}, now)     # 命中 → 权重落盘
         s_b = mk()                                             # "重启"
         i = next(i for i, c in enumerate(s_b.index.chunks) if "薄荷" in c)
         assert s_b.index.weights[i] > 1.0, \
@@ -1223,7 +1801,7 @@ def _selftest():
     # 11.【可靠命中门槛】零信号 query → isError + 明确"没有可靠命中"，且文案要
     #     解锁如实回答（instructions 堵的是"没查就说没记录"，查过之后的"没有"
     #     是诚实——两句话必须能共存，不然模型会在两条指令之间僵住）
-    miss = call(_build_server(now), "memory_search", {"query": "量子对撞机的运行日志"}, now)
+    miss = call(_build_server(now), "latent_search", {"query": "量子对撞机的运行日志"}, now)
     assert miss["isError"] is True and "没有可靠命中" in miss["content"][0]["text"]
     assert "如实" in miss["content"][0]["text"], "没找到时要明确解锁'如实说没有'"
 
@@ -1236,19 +1814,19 @@ def _selftest():
             retractions_path=rp)
         s12 = mk12(_build_server(now).index)
         #    写 correction 但缺当下状态 → 拒（病灶迁移，更正也不豁免）
-        bad12 = call(s12, "memory_correct",
+        bad12 = call(s12, "latent_correct",
                      {"quote": "保险丝熔断", "reason": "x", "correction": "y"}, now)
         assert bad12["isError"] is True and "当下状态" in bad12["content"][0]["text"]
         #    quote 定位不到 → 明确报错，不猜
-        miss12 = call(s12, "memory_correct", {"quote": "烤箱", "reason": "x"}, now)
+        miss12 = call(s12, "latent_correct", {"quote": "烤箱", "reason": "x"}, now)
         assert miss12["isError"] is True
         #    正常更正：撤回旧记录 + 写入更正 → 旧的查不到、新的当场可查
-        ok12 = call(s12, "memory_correct",
+        ok12 = call(s12, "latent_correct",
                     {"quote": "保险丝熔断", "reason": "维修方案已过时",
                      "correction": "咖啡机上月整机换新了，旧机的维修记录不再适用。",
                      "current_state": "新机运行正常。"}, now)
         assert ok12["isError"] is False and "已撤回" in ok12["content"][0]["text"]
-        after = call(s12, "memory_search", {"query": "咖啡机"}, now)
+        after = call(s12, "latent_search", {"query": "咖啡机"}, now)
         assert after["isError"] is False
         assert "保险丝熔断" not in after["content"][0]["text"] and \
                "整机换新" in after["content"][0]["text"], "旧的退出检索、更正当场可查"
@@ -1268,15 +1846,15 @@ def _selftest():
         mk12c = lambda: MemoryServer(index=load_corpus(td), thread_store=ThreadStore(),
                                      corpus_dir=td, retractions_path=rp)
         s_a12c = mk12c()
-        call(s_a12c, "memory_append",
+        call(s_a12c, "latent_append",
              {"text": "她想去的展览在下周三，先记着。", "current_state": "还没买票。"}, now)
-        ok12c = call(s_a12c, "memory_correct",
+        ok12c = call(s_a12c, "latent_correct",
                      {"quote": "下周三", "reason": "记错了，是下周四"}, now)
         assert ok12c["isError"] is False and "已撤回" in ok12c["content"][0]["text"]
         s_b12c = mk12c()                               # 重启：语料与账本都从盘上回来
         assert s_b12c.index.retracted, \
             "重启后撤回必须重新对上号（此前这里是空集：账本键是手拼块文本的孤儿）"
-        r12c = call(s_b12c, "memory_search", {"query": "展览是哪天"}, now)
+        r12c = call(s_b12c, "latent_search", {"query": "展览是哪天"}, now)
         assert "下周三" not in r12c["content"][0]["text"], \
             "被撤回的旧说法重启后不许再被召回——跟更正并排出现比撤回失败更糟"
 
@@ -1285,8 +1863,8 @@ def _selftest():
     #      模型决定"如实说没找到"还是"拿沾边的记录去圆"的分水岭
     from memory_retrieval import query_miss_rate as _qmr0, MISS_RATE_FLAG as _F0
     srv12b = _build_server(now)
-    hit12b = call(srv12b, "memory_search", {"query": "咖啡机 保险丝 熔断 通电"}, now)
-    miss12b = call(srv12b, "memory_search", {"query": "量子对撞机的运行日志"}, now)
+    hit12b = call(srv12b, "latent_search", {"query": "咖啡机 保险丝 熔断 通电"}, now)
+    miss12b = call(srv12b, "latent_search", {"query": "量子对撞机的运行日志"}, now)
     assert miss12b["isError"] is True and "核对提示" in miss12b["content"][0]["text"], \
         "空结果那条必须带缺失率标注——它是'如实说没找到'与'拿沾边记录去圆'的分水岭"
     #      **最要紧的一条：高缺失率不许硬拒**。这是本信号定性（专名缺席检测器，
@@ -1296,7 +1874,7 @@ def _selftest():
     #      （变异检查抓出来的缺口）
     mixed = "咖啡机 量子对撞机 报税"          # 高缺失率，但确实有真命中
     assert _qmr0(srv12b.index, mixed) >= _F0, "测试前提：这条要真的触发标注"
-    r_mixed = call(srv12b, "memory_search", {"query": mixed}, now)
+    r_mixed = call(srv12b, "latent_search", {"query": mixed}, now)
     assert r_mixed["isError"] is False, \
         "高缺失率查询**不许硬拒**——它只该带标注，判断权留给读得到内容的模型"
     assert "保险丝" in r_mixed["content"][0]["text"], "真命中必须照常返回"
@@ -1323,7 +1901,7 @@ def _selftest():
                                   _chunk_key(idx13.chunks[1]): ["望远镜"]},
                                  ensure_ascii=False), encoding="utf-8")
         s13 = MemoryServer(index=mk13(), thread_store=ThreadStore(), entities_path=ep)
-        r13 = call(s13, "memory_search", {"query": "山顶 土星"}, now)
+        r13 = call(s13, "latent_search", {"query": "山顶 土星"}, now)
         assert r13["isError"] is False and "阳台" in r13["content"][0]["text"], \
             "server 接上 .entities.json 后，换了说法的关联块该被图谱带回"
 
@@ -1512,6 +2090,15 @@ def _selftest():
         code, out = run_doctor(td)
         assert code != 0 and "--corpus" in out, f"缺 --corpus 要被拦下：{code} {out}"
 
+    # ⚠ 下面 18 系列会**故意**撞出四种拒绝，而被拒请求 2026.08.04 起会在服务端留一行
+    #    （18g 那张卡），于是这些行会跑到跑自检的人眼前。**先说一句它们不是出错**——
+    #    否则用户看到一屏「被拒 …」根本分不清自检过没过（真机第一次跑就被这样问了）。
+    #    ⚠ **刻意不做成「自检期间把它们吞掉」**：这张卡治的就是「压掉但不说」，
+    #    在它自己的自检里加一个静默开关是反过来走；而且真有一天拒绝在不该触发时触发了，
+    #    看得见比看不见强。所以是加一句说明，不是加一道闸。
+    print("⚠ 下面几行「被拒 …」是自检故意撞出来的（18 系列要挨个验四种拒绝该不该挡住），"
+          "不是出错——以最后一行 selftest ok 为准。", file=sys.stderr)
+
     # 18.【HTTP 传输·真端口往返】（2026.08.03「连不上 MCP 只好上 supergateway」
     #     那单）：supergateway 的四个实测坑逐个变成这里的一格——无鉴权（→401 两格
     #     ＋非回环裸跑拒绝）、传输不匹配（→握手/工具表/UTF-8 真 HTTP 往返）、
@@ -1540,7 +2127,7 @@ def _selftest():
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         base18 = f"http://127.0.0.1:{httpd.server_address[1]}/mcp"
 
-        def post18(payload, tok="s3cret", origin=None, method="POST"):
+        def post18(payload, tok="s3cret", origin=None, method="POST", accept=None):
             req = urllib.request.Request(
                 base18, data=(json.dumps(payload, ensure_ascii=False).encode("utf-8")
                               if payload is not None else None), method=method)
@@ -1548,6 +2135,8 @@ def _selftest():
                 req.add_header("Authorization", f"Bearer {tok}")
             if origin:
                 req.add_header("Origin", origin)
+            if accept:
+                req.add_header("Accept", accept)
             req.add_header("Content-Type", "application/json")
             try:
                 with urllib.request.urlopen(req, timeout=10) as r:
@@ -1566,18 +2155,18 @@ def _selftest():
                                  "params": {}})
         assert code18 == 200 and "protocolVersion" in body18
         code18, body18 = post18(lst18)
-        assert code18 == 200 and "memory_search" in body18
+        assert code18 == 200 and "latent_search" in body18
         code18, body18 = post18({"jsonrpc": "2.0",
                                  "method": "notifications/initialized"})
         assert code18 == 202 and not body18, "通知回 202 空身，不回 JSON-RPC 响应"
         #     中文 UTF-8 真 HTTP 往返：写回 → 当场检索命中（同 stdio 第 9 项的病灶）
         code18, body18 = post18({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                                 "params": {"name": "memory_append",
+                                 "params": {"name": "latent_append",
                                             "arguments": {"text": "绿萝换了大一号的盆。",
                                                           "current_state": "适应中。"}}})
         assert code18 == 200 and "已写进" in body18
         code18, body18 = post18({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
-                                 "params": {"name": "memory_search",
+                                 "params": {"name": "latent_search",
                                             "arguments": {"query": "绿萝换盆"}}})
         assert code18 == 200 and "大一号的盆" in body18, \
             f"中文该原样穿过 HTTP 并命中：{body18}"
@@ -1588,12 +2177,16 @@ def _selftest():
             "# 第9个窗口 · 2026-08-02\n\n## 2026-08-02 记\n手动上传：入手了一台"
             "折叠望远镜。\n当下状态：还没开箱。\n", encoding="utf-8")
         code18, body18 = post18({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
-                                 "params": {"name": "memory_search",
+                                 "params": {"name": "latent_search",
                                             "arguments": {"query": "望远镜"}}})
         assert code18 == 200 and "折叠望远镜" in body18, \
             "语料目录手动加的 md 必须下一个请求就查得到——不重读是静默的"
-        #     规格面三格：GET 无长流、DELETE 空操作、批量已移除
-        assert post18(None, method="GET")[0] == 405
+        #     规格面三格：GET／DELETE 空操作／批量已移除
+        #     ⚠ GET 那格 2026.08.07 从「恒 405」改成「按 Accept 分流」，判据跟着换：
+        #     **明确只要 JSON** 才 405（判据 7）；要 SSE、或压根没带 Accept 的
+        #     给一条空长流——那半在 18h，**不能在这儿用 urllib 验**，
+        #     `r.read()` 会一直读到流关闭，等于把自检挂死
+        assert post18(None, method="GET", accept="application/json")[0] == 405
         assert post18(None, method="DELETE")[0] == 200
         code18, body18 = post18([lst18])
         assert code18 == 400 and "批量" in body18
@@ -1654,7 +2247,7 @@ def _selftest():
         second = _raw_post(sk, tok="s3cret")        # 同一条连接重试 → 必须是 200
         assert "200" in second.split("\r\n")[0], \
             f"401 之后同连接重试必须正常——被拒的请求没吞掉 body：{second.splitlines()[0]}"
-        assert "memory_search" in second, "重试那发要真的拿到工具表"
+        assert "latent_search" in second, "重试那发要真的拿到工具表"
         sk.close()
         #     413 分支同形（超限也要吞）：谎报一个超大 Content-Length 但不发那么多，
         #     server 该在读之前就拒掉，且连接不许被污染
@@ -1699,8 +2292,57 @@ def _selftest():
         assert "ASCII" in str(e18b), "报错要说清是 ASCII 的问题并给修法"
     http_bind_guard("127.0.0.1", "s3cret-2026")     # ASCII 照常放行
 
+    # 18f.【非回环绑定多打一行 TLS 提醒·真进程，两个绑法都跑】（2026.08.04 外部实测
+    #     促成）：`http_bind_guard` 挡的是"非回环裸跑不配 token"，**不挡"没有 TLS"**，
+    #     于是配了 token 的用户走在裸 HTTP 暴露公网的路上、全程没人提醒过他。
+    #     ⚠ **必须起真进程**：提醒是在 `__main__` 里打的，只断纯函数就是"函数绿、
+    #     生产路径死"那张脸——把 `__main__` 里那两行删掉，纯函数断言一条都不会红。
+    #     ⚠ **两个绑法都要跑**：只跑非回环那次证明不了"回环时不吵"。
+    #     ⚠ **非回环那次带着 token 跑**：提醒不许看 token（token 与 TLS 是两件事），
+    #     做成"有 token 就不提示"这一格要红。
+    #     ⚠ 两次都断"横幅在"：否则进程压根没起来也能让"不含 TLS"那条恒真（假绿）。
+    #     变异：删掉 `__main__` 里打 notice 那两行 / 让 http_tls_notice 恒返回 None /
+    #           改成 token 已配就不打 → 各自红
+    def run_banner(corpus_dir, bind, *extra):
+        """起真进程跑 `--http`，收横幅那几行，然后掐掉。返回 stderr 文本。"""
+        proc = subprocess.Popen(
+            [sys.executable, str(here / "mcp_server.py"), "--corpus", str(corpus_dir),
+             "--http", bind, *extra],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+        got = []
+        pump = threading.Thread(target=lambda: got.extend(proc.stderr), daemon=True)
+        pump.start()
+        deadline = time.time() + 20
+        while time.time() < deadline and not any("语料变化自动重读" in x for x in got):
+            time.sleep(0.05)
+        time.sleep(0.5)          # 提醒行紧跟在横幅后面，给它落地的时间
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+        pump.join(timeout=5)
+        return "".join(got)
+
+    with tempfile.TemporaryDirectory() as td:
+        (_P(td) / "timeline").mkdir()
+        (_P(td) / "timeline" / "window_01_2026-08-01.md").write_text(
+            "# 第1个窗口 · 2026-08-01\n\n## 2026-08-01 记\n试养了一盆绿萝。\n"
+            "当下状态：长势正常。\n", encoding="utf-8")
+        out_pub = run_banner(td, "0.0.0.0:0", "--token", "s3cret-2026")
+        assert "Streamable HTTP 服务在" in out_pub, \
+            f"非回环 + token 必须照常起动（只提示、不拒绝）：{out_pub}"
+        assert "TLS" in out_pub, \
+            f"绑非回环要多打一行 TLS 提醒——配了 token 也照打：{out_pub}"
+        assert "127.0.0.1" in out_pub and "反向代理" in out_pub, \
+            f"提醒里要给出修法（绑回环 + 反代管 TLS），不能只说一句「有风险」：{out_pub}"
+        out_lo = run_banner(td, "127.0.0.1:0")
+        assert "Streamable HTTP 服务在" in out_lo, \
+            f"回环裸跑照常起动（反代在前的形态）：{out_lo}"
+        assert "TLS" not in out_lo, f"回环上不许吵这一句：{out_lo}"
+
     # 18e.【自动重读不许吞掉同窗口的手动上传·变异靶心】（2026.08.03 外部评审的竞态）：
-    #     原先 handle 之后无条件重算指纹，于是一次 memory_append 与用户手动上传
+    #     原先 handle 之后无条件重算指纹，于是一次 latent_append 与用户手动上传
     #     落在同一个请求窗口时，那次上传被自己的刷新吞掉、**再也不触发重读**——
     #     正好是这个特性要治的静默形态。改法是只把 server 自己写过的路径折进基线。
     #     变异：把 written_paths 那套换回 state["sig"] = _corpus_signature(...) → 这条红
@@ -1740,16 +2382,302 @@ def _selftest():
 
         srv18e.handle = handle_then_upload
         call18e({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                 "params": {"name": "memory_append",
+                 "params": {"name": "latent_append",
                             "arguments": {"text": "顺手记一条别的。",
                                           "current_state": "无。"}}})
         srv18e.handle = real_handle
         got18e = call18e({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                          "params": {"name": "memory_search",
+                          "params": {"name": "latent_search",
                                      "arguments": {"query": "望远镜"}}})
         assert "折叠望远镜" in got18e, \
             "同窗口里的手动上传不许被自己的写回吞掉——吞掉就再也不重读了（静默）"
         httpd18e.shutdown()
+
+    # 18g.【被拒的请求在服务端要留一行·四个靶心】（2026.08.04 立卡）：八种拒绝的
+    #     原因 `_deny` 每条都写清楚了，但那句话只进**响应体**，多数 MCP 客户端不显示；
+    #     服务端 `log_message` 整个静音，于是**两头都不说话**，八种原因在用户那里
+    #     长成同一个样子（「连不上」）。落点只有 `_deny` 一处（八条全走它）。
+    #     ⚠ **靶心二必须跟靶心一一起跑**：只跑靶心一的话，「正确实现」与「把
+    #     `log_message` 的静音整个掀掉」在证据上长得一模一样。
+    #     ⚠ 取证靠把 `sys.stderr` 换成 StringIO（`print(..., file=sys.stderr)` 每次
+    #     现查属性，替换全局有效）。这一格在进程内起 server，**不走起动横幅**，
+    #     所以捕到的行就是请求行本身；靶心二据此断"一行都没有"。
+    #     变异：① 删掉 `_deny` 里那行 `self._log_deny(...)` → 靶心一红；
+    #           ② 把 `_log_deny` 里的 `urlsplit(...).path` 换回 `self.path` → 靶心三红；
+    #           ③ 删掉 `_settle_locked` 里返回「另有 X 条」那一行（只保留上限压制）
+    #              → 靶心四红。
+    import socket as _socket18g
+    with tempfile.TemporaryDirectory() as td:
+        (_P(td) / "timeline").mkdir()
+        (_P(td) / "timeline" / "window_01_2026-08-01.md").write_text(
+            "# 第1个窗口 · 2026-08-01\n\n## 2026-08-01 记\n试养了一盆绿萝。\n"
+            "当下状态：长势正常。\n", encoding="utf-8")
+        loader18g = lambda: load_corpus(td)
+        srv18g = MemoryServer(index=loader18g(), thread_store=ThreadStore(),
+                              corpus_dir=td,
+                              retractions_path=_P(td) / ".retractions.json",
+                              loader=loader18g)
+        httpd18g = make_http_server(srv18g, host="127.0.0.1", port=0, token="s3cret")
+        threading.Thread(target=httpd18g.serve_forever, daemon=True).start()
+        port18g = httpd18g.server_address[1]
+        b18g = f"http://127.0.0.1:{port18g}"
+
+        def hit18g(path="/mcp", tok="s3cret", origin=None, method="POST", body=None,
+                   accept=None):
+            req = urllib.request.Request(b18g + path, data=body, method=method)
+            if tok:
+                req.add_header("Authorization", f"Bearer {tok}")
+            if origin:
+                req.add_header("Origin", origin)
+            if accept:
+                req.add_header("Accept", accept)
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status
+            except urllib.error.HTTPError as e:
+                e.read()
+                return e.code
+
+        def cap18g(fn):
+            """跑一段，返回它在 stderr 上留下的全部文本。"""
+            buf, old = io.StringIO(), sys.stderr
+            sys.stderr = buf
+            try:
+                fn()
+            finally:
+                sys.stderr = old
+            return buf.getvalue()
+
+        good18g = json.dumps({"jsonrpc": "2.0", "id": 1,
+                              "method": "tools/list"}).encode("utf-8")
+
+        #     靶心一（要说话）：401/403/404/405 各发一次 → **各出现一行**，
+        #     且那行同时含状态码、方法、路径、客户端 IP。
+        #     ⚠ 判的是四条各自出现，不是"stderr 非空"。
+        def _four():
+            assert hit18g(tok="wrong", body=good18g) == 401
+            assert hit18g(origin="https://evil.example", body=good18g) == 403
+            assert hit18g(path="/nope", method="GET") == 404
+            # ⚠ 要 405 就得**明确说只收 JSON**：不带 Accept 的 GET 现在拿到的是
+            # 一条空长流（2026.08.07 起），urllib 会挂在那儿读到天荒地老
+            assert hit18g(method="GET", accept="application/json") == 405
+
+        out18g = cap18g(_four)
+        for code18g, meth18g, path18g in (("401", "POST", "/mcp"), ("403", "POST", "/mcp"),
+                                          ("404", "GET", "/nope"), ("405", "GET", "/mcp")):
+            hits = [ln for ln in out18g.splitlines()
+                    if ln.startswith(f"被拒 {code18g} ")]
+            assert len(hits) == 1, f"{code18g} 要在 stderr 上留且只留一行：{out18g!r}"
+            assert meth18g in hits[0] and f" {path18g} " in hits[0] \
+                and "127.0.0.1" in hits[0], \
+                f"那一行要同时含方法、路径、客户端 IP：{hits[0]!r}"
+
+        #     靶心二（不许多说）：一次正常往返 → stderr 上**不出现任何请求行**。
+        #     断的是"一个字符都没有"：`log_message` 的静音一旦被掀掉，
+        #     这里会冒出 `"POST /mcp HTTP/1.1" 200 -` 那种访问日志。
+        def _ok():
+            assert hit18g(body=json.dumps(
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                 "params": {"name": "latent_search",
+                            "arguments": {"query": "绿萝"}}}).encode("utf-8")) == 200, \
+                "正常的 tools/call 该 200——它不 200 的话下面那条恒真（假绿）"
+
+        ok18g = cap18g(_ok)
+        assert ok18g == "", \
+            f"正常请求不许留痕——`log_message` 的静音不许被掀掉：{ok18g!r}"
+
+        #     靶心三（不许说漏嘴）：三条硬边界各钉一枚哨兵。
+        def _leak():
+            assert hit18g(tok="wrong-SENTINELA", body=good18g) == 401
+            assert hit18g(path="/nope?token=SENTINELB", method="GET") == 404
+            assert hit18g(body=b"{not json SENTINELC") == 400
+
+        leak18g = cap18g(_leak)
+        assert "SENTINELA" not in leak18g, f"Authorization 一个字符都不许进日志：{leak18g!r}"
+        assert "SENTINELB" not in leak18g, \
+            f"路径要剥掉 query（有客户端把 token 塞 ?token=）：{leak18g!r}"
+        assert "SENTINELC" not in leak18g, \
+            f"请求体不许进日志（里面是 latent_search 的问句／latent_append 的正文）：{leak18g!r}"
+        n404 = [ln for ln in leak18g.splitlines() if ln.startswith("被拒 404 ")]
+        assert len(n404) == 1 and " /nope " in n404[0], \
+            f"剥完 query 那行的路径要正好是 /nope：{n404!r}"
+
+        #     靶心四（上限不静默）：一个窗口内连发 200 条被拒 → 逐条行 ≤ 60，
+        #     **且出现「另有 140 条」那一行**（数目对得上）。压掉不说等于用一个
+        #     新的静默去修一个旧的静默。
+        #     ⚠ 窗口临时缩短到 5 秒，否则要等一分钟；同时**断这 200 发确实落在
+        #     一个窗口里**——夹具太慢导致窗口翻页，跟"上限失效"长得一样。
+        old_win = _HTTP_DENY_LOG_WINDOW
+        globals()["_HTTP_DENY_LOG_WINDOW"] = 5.0
+        try:
+            buf18g, old_err = io.StringIO(), sys.stderr
+            sys.stderr = buf18g
+            try:
+                t018g = time.monotonic()
+
+                def burst_one():
+                    """一条 keep-alive 连接上连发 20 个 404。
+                    ⚠ **10 条连接并发发**：单连接串行跑 200 发要 8 秒多
+                    （每发都吃一次 delayed-ACK，回环上实测 ~43ms），会跨出窗口。"""
+                    sk = _socket18g.create_connection(("127.0.0.1", port18g))
+                    sk.settimeout(10)
+                    for _ in range(20):
+                        sk.sendall(b"GET /nope HTTP/1.1\r\nHost: x\r\n\r\n")
+                        _recv_http(sk)    # 按 Content-Length 收满，理由见 18b
+                    sk.close()
+
+                ths18g = [threading.Thread(target=burst_one) for _ in range(10)]
+                for t in ths18g:
+                    t.start()
+                for t in ths18g:
+                    t.join(timeout=20)
+                burst18g = time.monotonic() - t018g
+                # 溢出那行由定时器在窗口末尾补打，等它
+                dead18g = time.monotonic() + 12
+                while time.monotonic() < dead18g and "另有" not in buf18g.getvalue():
+                    time.sleep(0.05)
+            finally:
+                sys.stderr = old_err
+            burst_out = buf18g.getvalue()
+        finally:
+            globals()["_HTTP_DENY_LOG_WINDOW"] = old_win
+        assert burst18g < 4.0, \
+            f"夹具太慢：这 200 发没落在同一个 5 秒窗口里（用了 {burst18g:.1f}s），" \
+            f"下面的 60／140 不作数——先修夹具，别当成上限失效"
+        each18g = [ln for ln in burst_out.splitlines() if ln.startswith("被拒 ")]
+        assert len(each18g) == _HTTP_DENY_LOG_MAX, \
+            f"逐条行要正好压到上限 {_HTTP_DENY_LOG_MAX} 行，实得 {len(each18g)}"
+        assert f"过去一分钟另有 {200 - _HTTP_DENY_LOG_MAX} 条被拒未逐条列出" in burst_out, \
+            f"压掉的条数必须说出来，且数目对得上：{burst_out!r}"
+        httpd18g.shutdown()
+
+    # 18h.【客户端拿 405 不回退就卡死 → 按 Accept 给它要的形态】（2026.08.07 立卡）。
+    #      两条独立的卡点，此前**在用户那头长成同一个样子**（「连不上」）：
+    #      ① GET 建长流、收到 405 却不改用 POST 的客户端会一直等；② 只认 SSE 响应体的客户端
+    #      收到 application/json 接不上——而 ② 是 2xx，`_deny` 够不着，
+    #      **服务端日志上一个字都没有**，比 ① 还阴。
+    #      ⚠ **这一格全程不许用 urllib**：长流没有 Content-Length，`r.read()`
+    #      会一直读到流关闭，自检当场挂死。走 http.client 并按字节数读。
+    #      ⚠ **真机那半量不到**：手上没有那个卡死的客户端，也没有 Kelivo／Operit
+    #      环境。这十条绿只证明**服务端形态已具备**，不证明「哪个客户端接上了」。
+    #      变异：① 把 do_POST 的 Accept 分支删掉 → 判据 1 红；
+    #            ② 把那个分支改成「只要有 text/event-stream 就回 SSE」→ 判据 2 红
+    #               （这是最容易写出来的错版本，它会把已经跑通的客户端带坏）；
+    #            ③ 把 do_GET 里「没带 Accept 也给流」那一支删掉 → 判据 5 红；
+    #            ④ 把 _HTTP_SSE_MAX_STREAMS 那道闸删掉 → 判据 8 红。
+    import http.client as _httpc18h
+    with tempfile.TemporaryDirectory() as td18h:
+        c18h = _P(td18h)
+        (c18h / "a.md").write_text("## 一\n试养了一盆绿萝。\n", encoding="utf-8")
+        loader18h = lambda: load_corpus(c18h)
+
+        def _mk18h(sse_stream=True):
+            srv = MemoryServer(index=loader18h(), thread_store=ThreadStore(),
+                               corpus_dir=c18h, loader=loader18h)
+            httpd = make_http_server(srv, host="127.0.0.1", port=0,
+                                     sse_stream=sse_stream)
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            return httpd, httpd.server_address[1]
+
+        def _conn18h(port, method, accept, body=None, path="/mcp"):
+            """发一发、把响应对象原样交出去（**不读 body**，长流要按字节读）。"""
+            conn = _httpc18h.HTTPConnection("127.0.0.1", port, timeout=10)
+            headers = {"Content-Type": "application/json"}
+            if accept is not None:
+                headers["Accept"] = accept
+            conn.request(method, path, body=body, headers=headers)
+            return conn, conn.getresponse()
+
+        httpd18h, port18h = _mk18h()
+        lst18h = json.dumps({"jsonrpc": "2.0", "id": 1,
+                             "method": "tools/list"}).encode("utf-8")
+        try:
+            # 判据 1：只要 SSE 的 POST → 单事件 SSE，且**能解回原来那条响应**
+            #         （只断 Content-Type 不够：包错格式一样是接不上）
+            cn, r = _conn18h(port18h, "POST", "text/event-stream", body=lst18h)
+            assert r.status == 200 and \
+                r.getheader("Content-Type", "").startswith("text/event-stream"), \
+                f"只要 SSE 的 POST 得回 SSE：{r.status} {r.getheader('Content-Type')}"
+            raw18h = r.read().decode("utf-8")
+            cn.close()
+            assert raw18h.startswith("event: message\ndata: ") and raw18h.endswith("\n\n"), \
+                f"SSE 帧形状不对：{raw18h!r}"
+            assert "latent_search" in json.dumps(
+                json.loads(raw18h.split("data: ", 1)[1].strip()), ensure_ascii=False), \
+                f"data: 那行要是原样那条 JSON-RPC 响应：{raw18h!r}"
+
+            # 判据 2（回归护栏，**这一条比 1 重要**）：规格要求客户端两个都写，
+            #         那种客户端**现在是跑通的**，不许被上面那条带坏
+            for acc18h in ("application/json, text/event-stream",
+                           "text/event-stream, application/json;q=0.9",
+                           "*/*"):
+                cn, r = _conn18h(port18h, "POST", acc18h, body=lst18h)
+                got18h = r.getheader("Content-Type", "")
+                r.read()
+                cn.close()
+                assert got18h.startswith("application/json"), \
+                    f"Accept={acc18h!r} 时必须照旧回 JSON，实得 {got18h!r}"
+            # 判据 3：压根没带 Accept → 照旧回 JSON
+            cn, r = _conn18h(port18h, "POST", None, body=lst18h)
+            got18h = r.getheader("Content-Type", "")
+            r.read()
+            cn.close()
+            assert got18h.startswith("application/json"), \
+                f"没带 Accept 的 POST 照旧回 JSON，实得 {got18h!r}"
+
+            # 判据 4／5：GET 空长流——要 SSE 的、以及**没带 Accept 的懒客户端**
+            for acc18h in ("text/event-stream", None):
+                cn, r = _conn18h(port18h, "GET", acc18h)
+                assert r.status == 200 and \
+                    r.getheader("Content-Type", "").startswith("text/event-stream"), \
+                    f"Accept={acc18h!r} 的 GET 要给长流：{r.status}"
+                assert r.read(6) == b": ok\n\n", "首字节要立刻给「流建起来了」的凭据"
+                cn.close()
+
+            # 判据 6：心跳真的发（把间隔临时调小；handler 每轮现读全局，所以生效）。
+            # ⚠ **必须 finally 还原**：漏还原的话后面几条会跟着变慢，且没人会红
+            old_hb18h = _HTTP_SSE_HEARTBEAT
+            globals()["_HTTP_SSE_HEARTBEAT"] = 0.2
+            try:
+                cn, r = _conn18h(port18h, "GET", "text/event-stream")
+                assert r.read(6) == b": ok\n\n"
+                assert r.read(13) == b": keepalive\n\n", \
+                    "没有心跳的话，反代和运营商网络会把这条流静默掐掉"
+                cn.close()
+            finally:
+                globals()["_HTTP_SSE_HEARTBEAT"] = old_hb18h
+
+            # 判据 8：开满之后第 N+1 条要 405，不许无限堆线程。
+            # ⚠ **响应对象也得攥住，不能只留 conn**（写第一版时在这儿栽了一次，
+            # 而且症状看着像产品缺陷）：`Connection: close` 的响应 `will_close`
+            # 为真，上一轮那个 HTTPResponse 一被 GC 就把 socket 关了，服务端当场
+            # 把名额还回去 → 第 5 条拿到 200，看起来像"闸没生效"。
+            # 顺带这也**正面证明了名额是即时释放的**（select 那半在干活）。
+            held18h = []
+            try:
+                for _ in range(_HTTP_SSE_MAX_STREAMS):
+                    cn, r = _conn18h(port18h, "GET", "text/event-stream")
+                    assert r.read(6) == b": ok\n\n"
+                    held18h.append((cn, r))
+                cn, r = _conn18h(port18h, "GET", "text/event-stream")
+                assert r.status == 405, f"长流开满之后要回 405，实得 {r.status}"
+                r.read()
+                cn.close()
+            finally:
+                for cn, _r18h in held18h:
+                    cn.close()
+        finally:
+            httpd18h.shutdown()
+
+        # 判据 9：--no-sse-stream 起的 server 退回旧行为（恒 405）
+        httpd18h2, port18h2 = _mk18h(sse_stream=False)
+        try:
+            cn, r = _conn18h(port18h2, "GET", "text/event-stream")
+            assert r.status == 405, f"--no-sse-stream 下 GET 恒 405，实得 {r.status}"
+            r.read()
+            cn.close()
+        finally:
+            httpd18h2.shutdown()
 
     # 19. CLI 入口必须把 stdout 锁成 UTF-8（`--doctor` 打的是中文报告）。第 8 项
     #     锁的是 stdio 传输那条流（serve_stdio 自己包 UTF-8），管不到 `print`。
@@ -1760,16 +2688,331 @@ def _selftest():
         f"CLI 入口没把 stdout 锁成 UTF-8（当前 {sys.stdout.encoding}）：" \
         "中文 Windows（cp936）下 --doctor 遇到 emoji 会 UnicodeEncodeError"
 
-    print("selftest ok（19项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
+    # 20.【时区穿到进程级·靶心】（2026.08.04 手机 Connector 真机事故，任务卡
+    #     「写回时区与跨日归窗」）。**前面 memory_retrieval／session_recall 的断言
+    #     喂的都是直接构造的 TimeContext，够不着"CLI 那个值有没有真的接上"**——
+    #     而事故现场坏的正是接线那一层（服务器压根没有这个概念）。所以这一项走
+    #     真进程，从 `--timezone` 一路断到写出来的文件名、H2 与召回标签。
+    #     四格矩阵：UTC 宿主／东八区用户 × 当场／重启。
+    from time_context import tzdb_available as _tzdb
+    east8_20 = "Asia/Shanghai" if _tzdb() else "UTC+08:00"    # 采集条件见 time_context
+    epoch20 = datetime(2026, 8, 3, 18, 5, 0, tzinfo=_dt_tz.utc).timestamp()   # 东八区 08-04 02:05
+    with tempfile.TemporaryDirectory() as td20:
+        corpus20 = _P(td20) / "corpus"
+        (corpus20 / "timeline").mkdir(parents=True)
+        srv20 = MemoryServer(index=MemoryIndex().build(), thread_store=ThreadStore(),
+                             corpus_dir=corpus20, time_context=TimeContext(east8_20))
+        r20 = srv20.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                            "params": {"name": "latent_append",
+                                       "arguments": {"text": "凌晨两点记下的一件事。",
+                                                     "current_state": "记完了。"}}},
+                           now=epoch20)
+        assert not r20["result"]["isError"], r20
+        assert "2026-08-04" in r20["result"]["content"][0]["text"], \
+            f"回执里的文件名该是用户自然日：{r20['result']['content'][0]['text']}"
+        #    a) 当场：latent_search 标的日期就是用户自然日（宿主在 UTC 也一样）
+        s20 = srv20.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                            "params": {"name": "latent_search",
+                                       "arguments": {"query": "凌晨两点记下的"}}})
+        assert "[2026.08.04" in s20["result"]["content"][0]["text"], \
+            f"当场检索的标签该是 08-04：{s20['result']['content'][0]['text']}"
+        #    b) 重启：换个新进程态的 server 从盘上重建，四处日期仍要一致
+        srv20b = MemoryServer(index=load_corpus(corpus20), thread_store=ThreadStore(),
+                              corpus_dir=corpus20, time_context=TimeContext(east8_20))
+        b20 = srv20b.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                             "params": {"name": "latent_session_start", "arguments": {}}})
+        assert "[2026.08.04" in b20["result"]["content"][0]["text"], \
+            f"重启后的开场召回该还是 08-04：{b20['result']['content'][0]['text']}"
+        #    c) 走真进程：--timezone 非法值必须非零退出，不许静默退 UTC
+        code20, out20 = run_doctor(td20, "--corpus", "corpus", "--timezone", "Asia/Shenzhen")
+        assert code20 != 0 and "Asia/Shenzhen" in out20, \
+            f"非法时区该报错退出（静默退 UTC 就是把这张卡的缺陷留回去）：{code20} / {out20}"
+        #    d) 走真进程：没配 --timezone 时 --doctor 必须报 ⚠ 并打出实际在用的时区
+        code20b, out20b = run_doctor(td20, "--corpus", "corpus")
+        assert "⚠ 时区" in out20b and "没配 --timezone" in out20b, \
+            f"没配时区要报 ⚠，这是那次事故唯一会露头的地方：{out20b}"
+        #    ⚠ 默认值改成东八区之后（2026.08.05 拍板），这一格**不许降成 ✓**：
+        #    对东八区以外的使用者它就是错的，降成 ✓ 等于给可能错的日期发合格证
+        assert "Asia/Shanghai" in out20b or "UTC+08:00" in out20b, \
+            f"没配时也要打出实际在用的默认时区，不能只说「没配」：{out20b}"
+        assert code20b == 0, "⚠ 不算失败（能用，只是会悄悄变差），退出码仍该是 0"
+        #    e) 配了就该是 ✓ 且报出名字——用户要能一眼认出服务器认的是不是他那个时区
+        code20c, out20c = run_doctor(td20, "--corpus", "corpus", "--timezone", east8_20)
+        assert f"✓ 时区：{east8_20}" in out20c and code20c == 0, \
+            f"配了时区该报 ✓ 并写出名字：{out20c}"
+
+    # 21.【启动失败要给人话、给出口，stdio 那条路上还要从协议里说得出来】
+    #     （2026.08.06，任务卡「服务端起不来时全是裸堆栈」）。
+    #     ⚠ **必须起真进程**：这几条全在 `__main__` 的分派里，纯函数断言盖不到——
+    #     把 `__main__` 里的 try/except 拆掉，只断 `startup_failure_report` 照样全绿，
+    #     那正是"函数绿、生产路径死"那张脸（同 18f 的理由）。
+    #     ⚠ **三条失败各造一次且互不串**：每一格既断"自己那句话在"，也断
+    #     "另外两条的话不在"——只断前者的话，一个把三条都印一遍的实现也是绿的。
+    #     ⚠ **这一项验的是「协议里说得出来」，不是「用户界面上看得见」**：
+    #     靶心二那半要拿真客户端（Operit／Claude Code）故意造一次失败、看它界面上
+    #     出现了什么，**我们在终端里看到了不算**。别把这一项读成靶心二已经验过。
+    #     变异：删掉 __main__ 里的 try/except（回到裸堆栈）/ 让 _startup_failed 直接
+    #           sys.exit 不起降级壳 / 三条话术合并成一句 → 各自红
+    _MARK21 = {                       # 三条各自的指纹（判据先写下来，再开始数）
+        1: "embedding 模型",          # 表里第 1 条：--embed 档，模型没下过 ＋ 没网
+        3: "被别的进程占着",           # 表里第 3 条：--http 端口被占
+        4: "正在读语料建索引",         # 表里第 4 条：语料大、加载慢（不是失败，只要求有话说）
+    }
+    # ⚠ 编号照任务卡那张表，**故意不重排**（②已划掉也不把③④提上来）：
+    # 重排会让别处对「②」的引用悄悄指向另一条。
+
+    def _only21(text, want):
+        """断言 `want` 那条的指纹在、另外两条的不在。"""
+        assert _MARK21[want] in text, f"第 {want} 条要说出自己那句人话：{text!r}"
+        for other, mark in _MARK21.items():
+            if other != want:
+                assert mark not in text, \
+                    f"第 {want} 条串出了第 {other} 条的话（「{mark}」）：{text!r}"
+
+    import socket as _socket21
+    with tempfile.TemporaryDirectory() as td21:
+        corpus21 = _P(td21) / "corpus"
+        (corpus21 / "timeline").mkdir(parents=True)
+        (corpus21 / "timeline" / "window_01_2026-06-01.md").write_text(
+            "## 起不来的那天\n服务端一句话都不说，只有一段堆栈。\n", encoding="utf-8")
+        logdir21 = _P(td21) / "logs"
+
+        def run_startup21(*argv, stdin_text=None, env_extra=None, timeout=90):
+            """起真进程，返回 (退出码, stdout, stderr)。"""
+            env21 = dict(os.environ, MEMORY_MCP_LOG_DIR=str(logdir21))
+            env21.update(env_extra or {})
+            p21 = subprocess.run(
+                [sys.executable, str(here / "mcp_server.py"),
+                 "--corpus", str(corpus21), *argv],
+                input=stdin_text, capture_output=True, text=True,
+                encoding="utf-8", env=env21, timeout=timeout)
+            return p21.returncode, p21.stdout, p21.stderr
+
+        #    a) 表里第 3 条：`--http` 端口被占。**真占一个端口**，不是模拟异常。
+        squat21 = _socket21.socket()
+        squat21.setsockopt(_socket21.SOL_SOCKET, _socket21.SO_REUSEADDR, 1)
+        squat21.bind(("127.0.0.1", 0))
+        squat21.listen(1)
+        busy_port21 = squat21.getsockname()[1]
+        try:
+            code21a, _, err21a = run_startup21("--http", f"127.0.0.1:{busy_port21}")
+        finally:
+            squat21.close()
+        assert code21a != 0, "端口被占该非零退出（能起来才是问题）"
+        assert "Traceback" not in err21a, \
+            f"第 3 条不许再出现裸堆栈——这正是本卡要消灭的东西：{err21a!r}"
+        _only21(err21a, 3)
+        assert "lsof" in err21a and "--http 127.0.0.1:8766" in err21a, \
+            f"第 3 条的出口要可照抄（换端口／查占用进程）：{err21a!r}"
+
+        #    b) 表里第 1 条：`--embed` 拿不到模型。**用一个真的连不上的 endpoint**
+        #       （刚关掉的本机端口 → ECONNREFUSED），不看这台机器装没装 fastembed——
+        #       靠"本机恰好没装某个包"的夹具，等哪天装上了就会静默变绿。
+        dead21 = _socket21.socket()
+        dead21.bind(("127.0.0.1", 0))
+        dead_port21 = dead21.getsockname()[1]
+        dead21.close()
+        embed_env21 = {"MEMORY_EMBED_ENDPOINT": f"http://127.0.0.1:{dead_port21}/v1/embeddings",
+                       "MEMORY_EMBED_API_KEY": "x-selftest-not-a-real-key"}
+        code21b, _, err21b = run_startup21(
+            "--embed", "--embed-provider", "cloud:selftest-model",
+            "--http", "127.0.0.1:0", env_extra=embed_env21)
+        assert code21b != 0, "拿不到模型该非零退出（不许悄悄降级成不带向量那档）"
+        assert "Traceback" not in err21b, f"第 1 条不许再出现裸堆栈：{err21b!r}"
+        _only21(err21b, 1)
+        assert "--step route --route zero-dep" in err21b, \
+            f"第 1 条的出口要写清正确出口是重跑 --step route：{err21b!r}"
+        assert "不要自己把配置里的 --embed 删掉" in err21b, \
+            f"第 1 条必须挡住「手删 --embed」那条隐患（配置要与 init_state 记的路线一致）：{err21b!r}"
+
+        #    c) 落盘：同一句话连完整堆栈写进 MEMORY_MCP_LOG_DIR 指的文件
+        log21 = logdir21 / "last-startup-error.log"
+        assert log21.exists(), f"启动失败要留一份可贴出来的报告：{logdir21}"
+        text21 = log21.read_text(encoding="utf-8")
+        assert "记忆协议服务端没能起来。" in text21 and "Traceback" in text21, \
+            f"报告里人话与完整堆栈都要有（人话给用户，堆栈给排查）：{text21[:400]!r}"
+
+        #    d) 【靶心二·代码那半】stdio 档失败时**不是死掉，而是起降级壳**，
+        #       那段人话从协议里回出去（instructions ＋ 任何 tools/call 的 isError）。
+        #       ⚠ 这只证明"协议里说得出来"；"用户界面上看得见"要真机验。
+        req21 = "\n".join(json.dumps(m, ensure_ascii=False) for m in (
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": PROTOCOL_VERSION, "clientInfo": {"name": "x"}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+             "params": {"name": "latent_search", "arguments": {"query": "随便查点什么"}}},
+        )) + "\n"
+        code21d, out21d, _ = run_startup21(
+            "--embed", "--embed-provider", "cloud:selftest-model",
+            stdin_text=req21, env_extra=embed_env21)
+        resp21 = [json.loads(x) for x in out21d.splitlines() if x.strip()]
+        assert len(resp21) == 3, \
+            f"降级壳也要照常按协议逐条回（否则客户端还是只有「连接失败」四个字）：{out21d!r}"
+        init21, list21, call21 = resp21
+        assert init21["result"]["protocolVersion"] == PROTOCOL_VERSION, init21
+        _only21(init21["result"]["instructions"], 1)
+        assert "--step route --route zero-dep" in init21["result"]["instructions"], \
+            "人话要进 instructions——客户端把它注入模型上下文，用户才看得到下一步"
+        names21 = [t["name"] for t in list21["result"]["tools"]]
+        assert names21 == ["memory_startup_error"], \
+            f"⚠ 降级壳一个真工具都不许提供（提供了就是变相放宽检查）：{names21}"
+        #       ⚠ 模型习惯性调 latent_search：那也必须回人话，不是「未知工具」
+        assert call21["result"]["isError"] is True, \
+            f"降级壳里任何调用都必须失败：{call21}"
+        _only21(call21["result"]["content"][0]["text"], 1)
+        assert code21d != 0, "壳退出时仍要非零——它不是一个能干活的服务"
+
+        #    e) 表里第 4 条：慢的时候有话说（靶心四：**只提示，不动加载时序**）。
+        #       ⚠ 这条走函数级夹具而不是真进程：真造一份"大到会慢"的语料，
+        #       跑一次要按分钟计，且多大会咬本来就没量过（任务卡第一节末那条）。
+        buf21, old21 = io.StringIO(), sys.stderr
+        sys.stderr = buf21
+        try:
+            done21 = slow_load_notice(thresholds=(0.05, 0.15))
+            time.sleep(0.4)
+            done21()
+        finally:
+            sys.stderr = old21
+        _only21(buf21.getvalue(), 4)
+        assert "没有卡死" in buf21.getvalue(), \
+            f"第 4 条要正面答「不是卡死」——客户端那头看到的就是像卡死：{buf21.getvalue()!r}"
+        #       不慢就不许出声（一进门就刷一行提示，是拿噪声冒充修好了）
+        buf21b, old21b = io.StringIO(), sys.stderr
+        sys.stderr = buf21b
+        try:
+            slow_load_notice(stream=buf21b, thresholds=(5.0, 30.0))()
+            time.sleep(0.2)
+        finally:
+            sys.stderr = old21b
+        assert buf21b.getvalue() == "", \
+            f"加载够快时一个字都不许打：{buf21b.getvalue()!r}"
+
+    # 22.【`被拒 405 GET` 那行要说清它到底是不是故障·三句补注各归各位】
+    #     （2026.08.06 立，2026.08.07 按 `HTTP传输不看Accept` 那张卡扩成三句）。
+    #     起因：Operit 连 Streamable HTTP 时先发 GET 建 SSE、收 405 后自动回退到 POST，
+    #     **连接其实是成功的**，但日志上那行跟真失败长得一模一样——实测里差一点
+    #     把一条通的路判成不通，所以在那行后面补了一句「这不是错误」。
+    #     ⚠ **2026.08.07 起那句话不能单独存在了**：GET 默认给空长流之后，还会 405
+    #     的只剩三种情形，而**只有第一种**是「不是错误」——
+    #       ① 客户端明确只要 JSON（它本来就没想建长流）→ `_NOTE_405_FALLBACK`；
+    #       ② `--no-sse-stream` 关着 → `_NOTE_405_OFF`（客户端若不回退就真的卡死）；
+    #       ③ 长流开满 → `_NOTE_405_BUSY`。
+    #     照抄第一句到②③上，就是**拿一个近似的东西冒充判据**（CLAUDE.md 第 10 条）：
+    #     把真故障说成不是故障，而且不会报错。
+    #     ⚠ **补注只准缀在 405 那一行**：401/403/404/411/413 那几条已经各说各的
+    #     原因、工作正常，不许被这句话糊上（所以下面同时断 404 那行三句都没有）。
+    #     变异：把 note 去掉 / 把它挂到 _log_deny 所有行上 / 三格共用同一句 → 各自红
+    import http.client as _httpc22
+    _ALL22 = (_NOTE_405_FALLBACK, _NOTE_405_OFF, _NOTE_405_BUSY)
+
+    def _cap22(fn):
+        """跑一段，返回它在 stderr 上留下的全部文本（同 18g 的取证手法）。"""
+        buf, old = io.StringIO(), sys.stderr
+        sys.stderr = buf
+        try:
+            fn()
+            time.sleep(0.3)
+        finally:
+            sys.stderr = old
+        return buf.getvalue()
+
+    def _get22(port, path="/mcp", accept="application/json", read=True):
+        c = _httpc22.HTTPConnection("127.0.0.1", port, timeout=10)
+        c.request("GET", path, headers={"Accept": accept} if accept else {})
+        r = c.getresponse()
+        if read:
+            r.read()
+            c.close()
+            return None
+        return c, r
+
+    def _lines22(text, code):
+        return [ln for ln in text.splitlines() if ln.startswith(f"被拒 {code} ")]
+
+    with tempfile.TemporaryDirectory() as td22:
+        corpus22 = _P(td22)
+        (corpus22 / "a.md").write_text("## 一\n随便一段话。\n", encoding="utf-8")
+        loader22 = lambda: load_corpus(corpus22)
+
+        def _mk22(sse_stream=True):
+            srv = MemoryServer(index=loader22(), thread_store=ThreadStore(),
+                               corpus_dir=corpus22, loader=loader22)
+            httpd = make_http_server(srv, host="127.0.0.1", port=0,
+                                     sse_stream=sse_stream)
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            return httpd, httpd.server_address[1]
+
+        # ① 客户端明确只要 JSON：这一格「不是错误」是对的；404 那行不许被糊上
+        httpd22, port22 = _mk22()
+        try:
+            out22 = _cap22(lambda: (_get22(port22), _get22(port22, path="/nope")))
+        finally:
+            httpd22.shutdown()
+        got405, got404 = _lines22(out22, 405), _lines22(out22, 404)
+        assert len(got405) == 1 and _NOTE_405_FALLBACK in got405[0], \
+            f"客户端只要 JSON 那格，405 要说「这不是错误」：{got405!r}"
+        assert len(got404) == 1 and not any(n in got404[0] for n in _ALL22), \
+            f"这三句只属于 405，别糊到别的被拒行上（404 是真的没这个端点）：{got404!r}"
+
+        # ② --no-sse-stream 关着：**不许再说「这不是错误」**，要说出口
+        httpd22b, port22b = _mk22(sse_stream=False)
+        try:
+            out22b = _cap22(lambda: _get22(port22b, accept="text/event-stream"))
+        finally:
+            httpd22b.shutdown()
+        got405b = _lines22(out22b, 405)
+        assert len(got405b) == 1 and _NOTE_405_OFF in got405b[0], \
+            f"关掉长流那格要指向出口（去掉开关）：{got405b!r}"
+        assert _NOTE_405_FALLBACK not in got405b[0], \
+            f"这一格照抄「这不是错误」就是把真卡死说成不是故障：{got405b!r}"
+
+        # ③ 长流开满：同样不许说「这不是错误」
+        httpd22c, port22c = _mk22()
+        held22 = []
+        try:
+            for _ in range(_HTTP_SSE_MAX_STREAMS):
+                c22, r22 = _get22(port22c, accept="text/event-stream", read=False)
+                assert r22.read(6) == b": ok\n\n"
+                held22.append((c22, r22))   # ⚠ 响应也要攥住，理由见 18h 判据 8
+            out22c = _cap22(lambda: _get22(port22c, accept="text/event-stream"))
+        finally:
+            for c22, _r22 in held22:
+                c22.close()
+            httpd22c.shutdown()
+        got405c = _lines22(out22c, 405)
+        assert len(got405c) == 1 and _NOTE_405_BUSY in got405c[0], \
+            f"开满那格要说清是开满了：{got405c!r}"
+        assert _NOTE_405_FALLBACK not in got405c[0], \
+            f"这一格照抄「这不是错误」同样是冒充判据：{got405c!r}"
+
+    print("selftest ok（22项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
           "完整链路 / stdio / UTF-8 / 写回当场可查 / 用进撑过重启 / "
           "无可靠命中明确说 / 撤回更正闭环 / 缺失率标注接线 / 实体标注接线 / "
           "部署体检只读 / 部署体检走真进程（相对路径解析开、空语料非零退出、"
           "每句一个 `##` 的导出要报切块警告）/ HTTP 传输真端口往返（鉴权 401、"
           "非回环裸跑拒绝、非 ASCII token 拒绝起动、Origin 403、路径 404、通知 202、"
-          "GET 405、批量 400、超限 413、chunked 501、keep-alive 下被拒后同连接重试、"
-          "UTF-8 写回即查、语料变化自动重读、同窗口手动上传不被写回吞掉）/ "
+          "只要 JSON 的 GET 回 405、批量 400、超限 413、chunked 501、"
+          "keep-alive 下被拒后同连接重试、"
+          "UTF-8 写回即查、语料变化自动重读、同窗口手动上传不被写回吞掉、"
+          "非回环绑定的起动横幅多打一行 TLS 提醒／回环时不打——真进程两个绑法都跑、"
+          "被拒的请求在服务端留一行（码／方法／剥掉 query 的路径／客户端 IP／原因，"
+          "正常请求照旧不打，token 与请求体不进日志，刷屏上限 60 行且溢出条数补一行）"
+          "）/ "
           "CLI 入口把 stdout 锁成 UTF-8（⚠ 变异要在 PYTHONIOENCODING=gbk 下跑，"
-          "默认 UTF-8 的机器上这条恒真））")
+          "默认 UTF-8 的机器上这条恒真）/ "
+          "时区穿到进程级（--timezone 一路到文件名／H2／当场检索标签／重启后开场召回，"
+          "非法名非零退出、没配报 ⚠ 且打出实际时区、配了报 ✓ 并写出名字）/ "
+          "启动失败给人话给出口·真进程（端口被占／拿不到模型／慢加载三条各造一次且互不串，"
+          "都不再是裸堆栈，报告连堆栈落盘；stdio 档起降级壳把那段话从协议里回出去——"
+          "instructions ＋ 任何 tools/call 都 isError，且一个真工具都不提供。"
+          "⚠ 这验的是「协议里说得出来」，「用户界面上看得见」要真机）/ "
+          "按 Accept 给客户端要的形态（只要 SSE 的 POST 回单事件 SSE 且能解回原响应，"
+          "两个都写／`*/*`／没带头一律照旧回 JSON——回归护栏；GET 给只发心跳、"
+          "永不发消息的空长流，没带 Accept 的懒客户端也给，心跳真的发，"
+          "开满 4 条回 405，--no-sse-stream 退回恒 405。"
+          "⚠ 这验的是「服务端形态已具备」，「哪个客户端接上了」要真机）/ "
+          "被拒 405 GET 那行按三种原因各说各的（只要 JSON＝这不是错误、"
+          "长流被关掉＝指出口、开满＝说开满），且三句都不许糊到别的被拒行上）")
 
 
 if __name__ == "__main__":
@@ -1796,17 +3039,39 @@ if __name__ == "__main__":
     ap.add_argument("--http", metavar="[HOST:]PORT",
                     help="改走 Streamable HTTP（省略 HOST 默认 127.0.0.1）——给只认 "
                          "HTTP 的客户端（Kelivo/Operit 这类）直连用，不再需要 "
-                         "supergateway 桥。非回环地址必须配 token，否则拒绝起动")
+                         "supergateway 桥。非回环地址必须配 token，否则拒绝起动；"
+                         "绑非回环还会多打一行 TLS 提醒——那条链路是裸 HTTP")
+    ap.add_argument("--no-sse-stream", dest="sse_stream", action="store_false",
+                    help="GET 不给 SSE 空长流、退回恒回 405 的旧行为。默认是给的："
+                         "有的客户端先发 GET 建长流、收到 405 也不改用 POST，就卡在"
+                         "等长流上（表现是「连不上」）。那条长流永远不发消息、只发心跳，"
+                         "本 server 没有服务器主动推送的场景")
+    ap.add_argument("--timezone", metavar="IANA名",
+                    help="记忆所有者的时区（例如 Asia/Shanghai），也可用环境变量 "
+                         "MEMORY_TIMEZONE。自然日＝这个时区的 00:00～23:59，写回归窗、"
+                         "记录标题与检索标签同一个口径。不配就用默认值 Asia/Shanghai"
+                         "（东八区），--doctor 会报 ⚠——⚠ 不在东八区的话一定要配，"
+                         "否则写下的记忆日期会静默错一天。没有 IANA 时区数据库的机器"
+                         "（Windows 裸装）可以装 tzdata，或退而写固定偏移 UTC+08:00"
+                         "（⚠ 不懂夏令时）")
     ap.add_argument("--token",
                     help="HTTP 传输的 Bearer token（也可用环境变量 MEMORY_HTTP_TOKEN；"
                          "客户端侧填进 bearerToken/Authorization 头）")
     args = ap.parse_args()
+    # 时区一个进程一份，stdio／HTTP／--doctor 三条路共用（任务卡"写回时区与跨日归窗"）。
+    # ⚠ 非法时区名直接非零退出：静默退 UTC 就是把这张卡修的缺陷原样留回去
+    tz_name = args.timezone or os.environ.get("MEMORY_TIMEZONE") or ""
+    try:
+        time_ctx = TimeContext(tz_name.strip()) if tz_name.strip() else TimeContext.default()
+    except ValueError as e:
+        ap.error(str(e))
     if args.selftest:
         _selftest()
     elif args.doctor:
         if not args.corpus:
             ap.error("--doctor 要跟 --corpus 一起用：体检的就是它指向的那个目录")
-        checks = diagnose(args.corpus, threads_path=args.threads, embed=args.embed)
+        checks = diagnose(args.corpus, threads_path=args.threads, embed=args.embed,
+                          time_context=time_ctx)
         print(format_doctor_report(checks))
         # 退出码给自动化用：有 ✗ 就非零，⚠ 不算失败（那些是"能用但会悄悄变差"）
         sys.exit(1 if any(c["level"] == FAIL for c in checks) else 0)
@@ -1817,25 +3082,60 @@ if __name__ == "__main__":
         loader = lambda: load_corpus(args.corpus, embed=args.embed,
                                      provider=(resolve_provider(args.embed_provider)
                                                if args.embed else None))
-        srv = MemoryServer(index=loader(),
-                           thread_store=ThreadStore(args.threads),
-                           corpus_dir=args.corpus,
-                           weights_path=Path(args.corpus) / ".weights.json",
-                           retractions_path=Path(args.corpus) / ".retractions.json",
-                           entities_path=Path(args.corpus) / ".entities.json",
-                           loader=loader)
+
+        def _startup_failed(stage, exc):
+            """启动失败的唯一出口：给人话、落盘、然后按传输形态决定怎么送到用户眼前。
+
+            ⚠ **别在这里加任何"那就降级起来吧"的分支**——检查该拒还是拒
+            （任务卡第五节第一条：这次的问题是失败时没给出路，不是失败判得太严）。"""
+            path = write_startup_log(
+                startup_failure_report(stage, exc, embed=args.embed,
+                                       http_bind=args.http), exc)
+            report = startup_failure_report(stage, exc, embed=args.embed,
+                                            http_bind=args.http, log_path=path)
+            print(report, file=sys.stderr)
+            if args.http:
+                # HTTP 档用户是自己在终端里敲的命令，stderr 就在他眼前，照常非零退出
+                sys.exit(1)
+            # stdio 档：stderr 进不了用户界面（客户端只显示「连接失败」），
+            # 改由降级壳把这段话从协议里送过去（2026.08.06 维护者拍板的修法）
+            StartupFailureServer(report).serve_stdio()
+            sys.exit(1)
+
+        # 慢的时候要有话说（第 4 条）：只加提示，不动加载时序（靶心四）
+        _load_done = slow_load_notice()
+        try:
+            srv = MemoryServer(index=loader(),
+                               thread_store=ThreadStore(args.threads),
+                               corpus_dir=args.corpus,
+                               weights_path=Path(args.corpus) / ".weights.json",
+                               retractions_path=Path(args.corpus) / ".retractions.json",
+                               entities_path=Path(args.corpus) / ".entities.json",
+                               loader=loader, time_context=time_ctx)
+        except Exception as e:                       # noqa: BLE001（裸堆栈正是本卡要消灭的）
+            _load_done()
+            _startup_failed("load", e)
+        finally:
+            _load_done()
         if args.http:
             host, _, port = args.http.rpartition(":")
             host = host or "127.0.0.1"
             token = args.token or os.environ.get("MEMORY_HTTP_TOKEN") or None
             try:
-                httpd = make_http_server(srv, host=host, port=int(port), token=token)
+                httpd = make_http_server(srv, host=host, port=int(port), token=token,
+                                         sse_stream=args.sse_stream)
             except ValueError as e:
                 ap.error(str(e))
+            except OSError as e:                     # 端口被占等绑定失败（第 3 条）
+                _startup_failed("bind", e)
             # 起动横幅进 stderr（stdio 传输里 stdout 是协议流，这里沿用习惯）
             print(f"Streamable HTTP 服务在 http://{host}:{httpd.server_address[1]} "
                   f"（鉴权：{'Bearer token' if token else '无——仅限回环+外层反代'}；"
                   f"语料变化自动重读）", file=sys.stderr)
+            # 非回环绑定多打一行 TLS 提醒：只提示、不拒绝起动，也不看有没有配 token
+            notice = http_tls_notice(host)
+            if notice:
+                print(notice, file=sys.stderr)
             httpd.serve_forever()
         else:
             srv.serve_stdio()

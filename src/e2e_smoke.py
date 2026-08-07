@@ -7,8 +7,8 @@
 
   合成导出 json → 导入（load_any）→ 体检 → 出问卷 → 模拟模型答卷（文本）
   → parse_answer_sheet 解析 → 合并候选 → 逐条确认 → 四件套出货
-  → load_corpus 回读 → MemoryServer 完整握手 → memory_search 命中导入原文
-  → thread_close 往返
+  → load_corpus 回读 → MemoryServer 完整握手 → latent_search 命中导入原文
+  → latent_thread_close 往返
 
 两条纪律：
 
@@ -20,7 +20,7 @@
   出货语料回读零 mtime、检索命中的必须是导入原文。这些是跨文件约定，单测各自绿
   也可能合起来错。
 
-写回也在链里（memory-writeback 合并后补上的一环）：memory_append → 当场可查 →
+写回也在链里（memory-writeback 合并后补上的一环）：latent_append → 当场可查 →
 模拟重启 → 记录从盘上回来、命中过的块权重仍 >1.0（用进撑过重启）。
 
 零依赖，stdlib only。合成语料全部虚构。
@@ -160,7 +160,7 @@ def _compile_v2_case(root, persona=None, corpus=None, candidates=None,
         versions = question["section_versions"]
         chosen = next((version for version in versions
                        if preferred_text and preferred_text in version["markdown"]), versions[0])
-        decisions[question["section"]] = chosen["id"]
+        decisions[question["section"]] = chosen["version_id"]
     _run_compiler_cli(root, "--step", "choose-sections", "--section-decisions-json",
                       json.dumps(decisions, ensure_ascii=False), "--json")
     preview = json.loads(_run_compiler_cli(root, "--step", "preview", "--json").stdout)
@@ -198,14 +198,22 @@ def run_persona_compiler_cases():
         preview, _ = _compile_v2_case(
             original_case, original, corpus_dir, rich,
             preferred_text="绝不讨论她没有主动带起的家庭细节")
-        from persona_compiler import parse_original_persona
+        from persona_compiler import is_heading_block, parse_original_persona
+        original_items = parse_original_persona(original)
         assert all(item.text.rstrip() in preview["persona_markdown"]
-                   for item in parse_original_persona(original)), \
-            "原人格重排后每个逐字块都必须完整出现"
+                   for item in original_items if not is_heading_block(item)), \
+            "原人格重排后每个逐字正文块都必须完整出现"
+        # ⚠ **标题块除外**（2026.08.04，走查台账第二条）：标题打的是 `operation="delete"`
+        #   ——不是丢掉，是不再进正文，由十二节骨架统一渲染一遍，否则每个标题在产出
+        #   文件里出现两遍。所以这里改成数「标题里那几个字只出现一次」。
+        for heading in ("我是谁", "最终约定"):
+            assert preview["persona_markdown"].count(heading) == 1, \
+                f"节标题「{heading}」在产出文本里出现了 " \
+                f"{preview['persona_markdown'].count(heading)} 次"
         assert "第一次完成海图修复" in preview["persona_markdown"], "语料应补入具体里程碑"
         assert "风格参考，非台词" in preview["persona_markdown"], "真实风格片段必须带学习免责声明"
         # 免责声明的检索层那半也必须真的落到出货文本里（任务卡 风格片段挤掉检索）：
-        # 只有前半时，模型有片段可答就不去调 memory_search。删掉这半这条必须红。
+        # 只有前半时，模型有片段可答就不去调 latent_search。删掉这半这条必须红。
         assert "不是记忆" in preview["persona_markdown"] \
             and "先查记忆库" in preview["persona_markdown"], \
             "免责声明必须同时带检索层那半（片段不是记忆、提到过去先查库）"
@@ -277,7 +285,7 @@ def run_persona_compiler_cases():
                           json.dumps({"items": [], "source_accounting": []}), "--json")
         questions = json.loads(_run_compiler_cli(
             migration_root, "--step", "choose-sections", "--json").stdout)
-        decisions = {question["section"]: question["section_versions"][0]["id"]
+        decisions = {question["section"]: question["section_versions"][0]["version_id"]
                      for question in questions["sections"]}
         _run_compiler_cli(migration_root, "--step", "choose-sections",
                           "--section-decisions-json", json.dumps(decisions), "--json")
@@ -326,13 +334,13 @@ def run_http_transport_case():
             assert "protocolVersion" in r, f"真进程握手没过：{r[:200]}"
             #    接缝⑥-2：中文写回穿过真 HTTP（CLI 起的进程，stdout 不是协议流）
             r = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                     "params": {"name": "memory_append",
+                     "params": {"name": "latent_append",
                                 "arguments": {"text": "绿萝缓过来了，抽了新叶。",
                                               "current_state": "长势稳住了。"}}})
             assert "已写进" in r, f"真进程写回没成：{r[:200]}"
             #    接缝⑥-3：同一条连接复用（keep-alive）后检索命中——手机 App 的常态
             r = rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                     "params": {"name": "memory_search",
+                     "params": {"name": "latent_search",
                                 "arguments": {"query": "绿萝抽新叶"}}})
             assert "抽了新叶" in r, f"复用连接后检索没命中：{r[:200]}"
             sock.close()
@@ -438,7 +446,7 @@ def _selftest():
             "人格文件开头是标题、收尾是最终约定（顺序即权重）"
         #    第三轮真机实测（设计笔记）：人格文件里写明工具名的检索约定是主动性
         #    的主力杠杆——出货物必须带着它，且与被验证过的写法一致（点名工具）
-        assert "memory_search" in md and "session_start" in md, \
+        assert "latent_search" in md and "latent_session_start" in md, \
             "检索约定与会话约定（主动性主力杠杆）必须在人格文件里，且点名工具"
 
         #    接缝断言①：mcp-config 的 --corpus 必须指向真写了语料的那个目录——
@@ -474,21 +482,21 @@ def _selftest():
         call = lambda name, a: srv.handle(
             {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
              "params": {"name": name, "arguments": a}}, now=now)["result"]
-        hit = call("memory_search", {"query": "鲸头鹳的约定"})
+        hit = call("latent_search", {"query": "鲸头鹳的约定"})
         assert hit["isError"] is False, f"检索不该失败：{hit}"
         #    接缝断言③：命中的必须是导入语料的**原文**，不是任何中间加工物
         assert "这个周末去看鲸头鹳" in hit["content"][0]["text"], \
             "检索命中的该是导入对话的原话"
-        closed = call("thread_close", {"window": 3, "current_state": "约定已兑现，这条线收尾。"})
+        closed = call("latent_thread_close", {"window": 3, "current_state": "约定已兑现，这条线收尾。"})
         assert closed["isError"] is False and srv.thread_store.latest().window == 3
 
-        # 6. 写回：memory_append → 当场可查 → "重启"后记录和权重都从盘上回来
+        # 6. 写回：latent_append → 当场可查 → "重启"后记录和权重都从盘上回来
         #    （memory-writeback 合并后补的一环——记忆库自己生长的那半支笔进链）
-        wrote = call("memory_append",
+        wrote = call("latent_append",
                      {"text": "她说下次想去看企鹅漫步，最好挑个凉快的早上。",
                       "current_state": "新约定，档期还没定。"})
         assert wrote["isError"] is False, f"写回不该失败：{wrote}"
-        hit2 = call("memory_search", {"query": "企鹅漫步"})
+        hit2 = call("latent_search", {"query": "企鹅漫步"})
         assert hit2["isError"] is False and "凉快的早上" in hit2["content"][0]["text"], \
             "写回之后当场就要能查到原文"
         #    接缝断言④：模拟客户端重启 server（新进程 = 重新 load_corpus + 生产
@@ -505,18 +513,18 @@ def _selftest():
         callf = lambda s, name, a: s.handle(
             {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
              "params": {"name": name, "arguments": a}}, now=now)["result"]
-        hit3 = callf(srv2, "memory_search", {"query": "企鹅漫步"})
+        hit3 = callf(srv2, "latent_search", {"query": "企鹅漫步"})
         assert hit3["isError"] is False and "凉快的早上" in hit3["content"][0]["text"], \
             "重启后写回的记录该从盘上回来——不然'记住了'只活一个进程"
 
         # 7. 更正闭环（错误记忆治理，验收反馈后补的一环）：撤回记错的记录并写更正
         #    → 旧的退出检索、更正当场可查 → 再"重启"一次撤回仍生效（账本在盘上）
-        fixed = callf(srv2, "memory_correct",
+        fixed = callf(srv2, "latent_correct",
                       {"quote": "凉快的早上", "reason": "她说记错了，想看的不是企鹅",
                        "correction": "她更正说想看的是火烈鸟，不是企鹅漫步。",
                        "current_state": "改成看火烈鸟，档期还没定。"})
         assert fixed["isError"] is False, f"更正不该失败：{fixed}"
-        hit4 = callf(srv2, "memory_search", {"query": "企鹅漫步"})
+        hit4 = callf(srv2, "latent_search", {"query": "企鹅漫步"})
         #    接缝断言⑤：撤回的原文不再出现在任何返回里（可能还有更正记录被命中，
         #    但"凉快的早上"那段旧原文必须消失）
         assert hit4["isError"] is True or "凉快的早上" not in hit4["content"][0]["text"], \
@@ -525,7 +533,7 @@ def _selftest():
                             thread_store=ThreadStore(),
                             corpus_dir=got["memory_dir"], weights_path=weights_path,
                             retractions_path=retractions_path)
-        hit5 = callf(srv3, "memory_search", {"query": "火烈鸟"})
+        hit5 = callf(srv3, "latent_search", {"query": "火烈鸟"})
         assert hit5["isError"] is False and "火烈鸟" in hit5["content"][0]["text"], \
             "更正内容该从盘上回来"
         assert srv3.index.retraction_log, \
